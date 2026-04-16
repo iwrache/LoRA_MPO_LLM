@@ -1,0 +1,15 @@
+[
+  {
+    "name": "MPO (Ours)",
+    "ppl": {},
+    "zs": {
+      "openbookqa": 26.6,
+      "arc_easy": 29.7,
+      "arc_challenge": 29.4,
+      "winogrande": 51.1,
+      "hellaswag": 31.0,
+      "piqa": 53.8,
+      "average": 36.9
+    }
+  }
+]

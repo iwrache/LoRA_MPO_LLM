@@ -1,0 +1,15 @@
+[
+  {
+    "name": "Original LLaMA-7B",
+    "ppl": {},
+    "zs": {
+      "openbookqa": 44.2,
+      "arc_easy": 73.8,
+      "arc_challenge": 45.0,
+      "winogrande": 69.5,
+      "hellaswag": 76.2,
+      "piqa": 78.7,
+      "average": 64.6
+    }
+  }
+]
