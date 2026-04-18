@@ -11,31 +11,60 @@ from datasets import load_dataset, concatenate_datasets
 import random
 
 
-def quick_evaluate_generation(model, tokenizer, prompts):
-    """极其轻量的肉眼评估生成器"""
-    print(f"\n{'='*50}\n👀 [肉眼质量评估] 正在生成测试文本...\n{'-'*50}")
-    model.eval()
+def quick_evaluate_generation(student_model, teacher_model, tokenizer, prompts):
+    """极速对比评估：同时输出压缩后(Student)和压缩前(Teacher)的结果"""
+    print(f"\n{'='*60}\n👀 [双轨质量评估] 正在生成 Teacher vs Student 对比文本...\n{'-'*60}")
+    
+    # 确保两个模型都处于推理模式
+    student_model.eval()
+    if teacher_model is not None:
+        teacher_model.eval()
+    
+    # 获取两者的首层设备 (兼容多卡 device_map)
+    device_s = next(student_model.parameters()).device
+    device_t = next(teacher_model.parameters()).device if teacher_model else device_s
+    
     for prompt in prompts:
-        # 包装成对话格式
-        chat_prompt = f"<|user|>\n{prompt}</s>\n<|assistant|>\n"
-        inputs = tokenizer(chat_prompt, return_tensors="pt").to(next(model.parameters()).device)
+        # 使用最朴素、最安全的问答格式
+        chat_prompt = f"Question: {prompt}\nAnswer:"
         
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            outputs = model.generate(
-                **inputs, 
-                max_new_tokens=60,       # 只生成 60 个 token，几秒钟搞定
-                do_sample=True,          # 开启采样看真实分布
-                temperature=0.7,
+        print(f"👤 Question: {prompt}\n")
+        
+        # ----------------------------------------------------
+        # 👑 1. 跑原版 Teacher (看看“满分答案”长什么样)
+        # ----------------------------------------------------
+        if teacher_model is not None:
+            inputs_t = tokenizer(chat_prompt, return_tensors="pt").to(device_t)
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float32):
+                t_outputs = teacher_model.generate(
+                    **inputs_t, 
+                    max_new_tokens=60,
+                    do_sample=False, temperature=None, top_p=None,
+                    repetition_penalty=1.5, # 强心针：防复读
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            t_text = tokenizer.decode(t_outputs[0][inputs_t.input_ids.shape[1]:], skip_special_tokens=True)
+            print(f"👑 [原版 Teacher]: {t_text.strip()}\n")
+        
+        # ----------------------------------------------------
+        # 🤖 2. 跑压缩 Student (看看“术后患者”恢复得怎么样)
+        # ----------------------------------------------------
+        inputs_s = tokenizer(chat_prompt, return_tensors="pt").to(device_s)
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float32):
+            s_outputs = student_model.generate(
+                **inputs_s, 
+                max_new_tokens=60,
+                do_sample=False, temperature=None, top_p=None,
+                repetition_penalty=1.5, # 强心针：防复读
                 pad_token_id=tokenizer.eos_token_id
             )
+        s_text = tokenizer.decode(s_outputs[0][inputs_s.input_ids.shape[1]:], skip_special_tokens=True)
+        print(f"🤖 [压缩 Student]: {s_text.strip()}\n")
         
-        # 只截取模型新生成的部分
-        generated_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-        print(f"👤 User: {prompt}")
-        print(f"🤖 LLaMA: {generated_text.strip()}\n{'-'*50}")
+        print("-" * 60)
     
-    model.train() # 评估完切回训练模式
-    print("="*50 + "\n")
+    student_model.train() # 评估完切回训练模式
+    print("="*60 + "\n")
 
 class WikiCalibrationDataset(Dataset):
     """用于知识恢复的 Wikitext 数据集（纯语言建模，无 loss masking）"""
@@ -166,10 +195,10 @@ def save_checkpoint(model, optimizer, scheduler, epoch, step, global_update_step
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
     }, checkpoint_path)
     
-    # 滚动删除，只保留最近 2 个
+    # 滚动删除，只保留最近 1 个
     existing_ckpts = glob.glob(os.path.join(checkpoint_dir, "checkpoint_upd_*.pt"))
     existing_ckpts.sort(key=os.path.getmtime)
-    while len(existing_ckpts) > 2:
+    while len(existing_ckpts) > 1:
         oldest_ckpt = existing_ckpts.pop(0)
         os.remove(oldest_ckpt)
         print(f"🗑️ 已清理过期存档: {oldest_ckpt}")
@@ -240,13 +269,13 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="ch
         # 1. 收集 LoRA 捷径
         if "lora_A" in name or "lora_B" in name:
             param.requires_grad = True
-            param.data = param.data.to(torch.bfloat16)
+            param.data = param.data.to(torch.float32)
             lora_params.append(param)
             trainable_params_count += param.numel()
         # 2. 收集 MPO 与 TT 核心 (解冻它们！)
         elif "core" in name:
             param.requires_grad = True
-            param.data = param.data.to(torch.bfloat16)
+            param.data = param.data.to(torch.float32)
             mpo_params.append(param)
             trainable_params_count += param.numel()
                 
@@ -260,6 +289,12 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="ch
     teacher_model.eval()
     for param in teacher_model.parameters():
         param.requires_grad = False
+
+    # ====================================================
+    # 💡 极速修复：贴上 Hugging Face 官方的防刷屏护身符
+    # ====================================================
+    if hasattr(student_model, "enable_input_require_grads"):
+        student_model.enable_input_require_grads()
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -280,11 +315,21 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="ch
         raise ValueError("暂不支持的数据集！")
 
 
+    # 准备 DataLoader
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
                             collate_fn=lambda b: chat_collate_fn(b, tokenizer.pad_token_id))
     
+    # ====================================================
+    # 💡 修复：必须先计算 feat_layers，再构建投影层！
+    # ====================================================
+    num_layers = len(student_model.model.layers)
+    feat_layers = [i for i in range(0, num_layers, max(1, num_layers // 4))]
+    if (num_layers - 1) not in feat_layers:
+        feat_layers.append(num_layers - 1)
+    print(f"🔍 Feature 蒸馏对齐层级: {feat_layers}")
+
     # ------------------------------------------
-    # 💡 修复 2（前期准备）：引入 Feature 蒸馏的投影层 (Hint Regression)
+    # 引入 Feature 蒸馏的投影层 (Hint Regression)
     # ------------------------------------------
     hidden_size = student_model.config.hidden_size
     loss_device = next(p.device for p in student_model.parameters() if p.device.type == 'cuda')
@@ -292,8 +337,7 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="ch
     # 为每一个需要对齐的层，建立一个从 Student 映射到 Teacher 空间的线性层
     feat_projectors = nn.ModuleList([
         nn.Linear(hidden_size, hidden_size, bias=False) for _ in feat_layers
-    ]).to(loss_device)
-    feat_projectors.to(torch.bfloat16) # 保持精度一致
+    ]).to(loss_device).to(torch.float32) # 保持精度一致
 
     # 将投影层参数也加入优化器！
     optimizer_grouped_parameters = [
@@ -302,6 +346,7 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="ch
         {"params": feat_projectors.parameters(), "lr": lr} # 👈 投影层跟随主学习率训练
     ]
 
+    # 构建优化器
     optimizer = bnb.optim.AdamW8bit(optimizer_grouped_parameters, weight_decay=0.01)
     
     # Cosine 衰减 + Warmup
@@ -330,17 +375,11 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="ch
     
     # ====================================================
     # 💡 修复：DataParallel 安全解包获取真实模型结构
-    # ====================================================
+    # ====================================================ƒdel
     # 如果穿着 DP 防弹衣，就拉开拉链 (.module) 进去看，否则直接看
     # 确定 loss 汇聚设备（只算一次）
     loss_device = next(p.device for p in student_model.parameters() if p.device.type == 'cuda')
 
-    num_layers = len(student_model.model.layers)
-    
-    feat_layers = [i for i in range(0, num_layers, max(1, num_layers // 4))]
-    if (num_layers - 1) not in feat_layers:
-        feat_layers.append(num_layers - 1)
-    print(f"🔍 Feature 蒸馏对齐层级: {feat_layers}")
 
     trainable_params = [p for p in student_model.parameters() if p.requires_grad]
     for epoch in range(start_epoch, epochs):
@@ -354,14 +393,14 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="ch
             # 1. 👻 获取 Teacher 目标 (全程无梯度)
             # ------------------------------------------
             with torch.no_grad():
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                with torch.amp.autocast('cuda', dtype=torch.float32):
                     # output_hidden_states=True 绝杀！无需繁琐的 Hook！
                     t_outputs = teacher_model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
             
             # ------------------------------------------
             # 2. 🧠 获取 Student 输出
             # ------------------------------------------
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda', dtype=torch.float32):
                 s_outputs = student_model(input_ids, attention_mask=attention_mask, labels=labels, output_hidden_states=True)
                 loss_task = s_outputs.loss
                 
@@ -468,9 +507,11 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="ch
             if global_update_step > 0 and global_update_step % 200 == 0:
                 eval_prompts = [
                     "Explain quantum computing in simple terms.",
-                    "Write a Python function to sort a list."
+                    "Write a Python function to sort a list.",
+                    "The capital of France is", # 测常识
+                    "10 + 25 = " # 测逻辑
                 ]
-                quick_evaluate_generation(student_model, tokenizer, eval_prompts)
+                quick_evaluate_generation(student_model, teacher_model, tokenizer, eval_prompts)
         # epoch 结束，打印汇总
         avg_epoch_loss = epoch_loss / (step + 1)
         elapsed = (time.time() - t0) / 60
@@ -533,7 +574,7 @@ def get_mixed_healing_dataset(seed=42):
     # ==========================================
     print("   -> 抽取高质量百科常识数据 (Dolly-v2)")
     # 使用 dolly-v2 替代老旧拉胯的 wiki_qa
-    wiki_ds = load_dataset("databricks/dolly-v2-12k", split="train")
+    wiki_ds = load_dataset("databricks/databricks-dolly-15k", split="train")
     
     # 💡 核心过滤：只留下百科常识和通用问答，去掉摘要、头脑风暴等杂质
     wiki_ds = wiki_ds.filter(lambda x: x["category"] in ["open_qa", "general_qa"])
