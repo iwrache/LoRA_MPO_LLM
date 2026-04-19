@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MPO 究极两阶段压缩管线 (Final Bulletproof Edition v2.0)
-包含：Teacher-Forcing、原始PPL、逐层参数追踪雷达、原子断点续传！
+MPO 究极两阶段压缩管线 (Platinum V3.0)
+包含：全精度 Float32、对称U型保护、Teacher-Forcing、参数雷达、原子断点续传！
 """
 
 import os
@@ -31,6 +31,14 @@ from test_MPO import factor_linear_mpo_custom, find_factors_balanced
 from mpo_modules.factorization import estimate_mpo_bond_dim
 from calibration import get_activation_scales
 from healing import train_healing
+
+
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="Full backward hook is firing"
+)
 
 def compute_mpo_core_shapes(out_fac, in_fac, bond_dim, num_cores):
     shapes, prev = [], 1
@@ -115,7 +123,6 @@ def eval_ppl(model, tokenizer, max_len=2048, stride=512, max_tokens=15000):
     ppl = torch.exp(torch.tensor(nlls).mean()).item()
     return round(ppl, 2)
 
-# 全局参数统计宏观战报
 def print_param_compression_report(teacher_model, student_model):
     orig_params = sum(p.numel() for p in teacher_model.parameters())
     new_params = sum(p.numel() for p in student_model.parameters())
@@ -136,9 +143,30 @@ def print_param_compression_report(teacher_model, student_model):
     print(f"    🌟 全局保留率: {new_params / orig_params:>8.2%}")
     print("="*70)
 
+# =======================================================
+# 🚀 全新升级：首尾绝对保护的对称 U 型保留率公式
+# =======================================================
 def get_u_shape_ratio(layer_idx, total_layers, target_ratio):
-    x = (layer_idx - (total_layers - 1) / 2.0) / ((total_layers - 1) / 2.0)
-    return max(0.2, min(0.95, (target_ratio - 0.15) + 0.45 * (x ** 2)))
+    # 首尾各 3 层完全不压，保留率 1.0 (100%)
+    if layer_idx < 3 or layer_idx >= total_layers - 3:
+        return 1.0
+        
+    # 中间部分构成完美的对称 U 型抛物线
+    start_idx = 3
+    end_idx = total_layers - 4
+    center = (start_idx + end_idx) / 2.0
+    half_range = (end_idx - start_idx) / 2.0
+    
+    # 归一化到 [-1, 1]
+    x = (layer_idx - center) / half_range
+    
+    # 抛物线方程: 最低点由 target_ratio 决定，两端翘起
+    base = max(0.1, target_ratio - 0.15)
+    amplitude = 0.45 
+    
+    ratio = base + amplitude * (x ** 2)
+    # 将 U 型部分的最大保留率限制在 0.95，防止和首尾 100% 混淆
+    return max(0.1, min(0.95, ratio))
 
 def main():
     parser = argparse.ArgumentParser(description="MPO 究极控制台")
@@ -154,7 +182,7 @@ def main():
     custom_ratio_map = dict(zip(args.custom_layers, args.custom_ratios))
 
     print("="*70)
-    print(" 🚀 究极两阶段压缩管线启动 (Teacher-Forcing + 实时参数追踪)")
+    print(" 🚀 究极两阶段压缩管线启动 (Float32 满血精度 + 首尾保护对称 U 型)")
     if custom_ratio_map: print(f" 🎯 注入了自定义层压缩率: {custom_ratio_map}")
     print("="*70)
     
@@ -168,9 +196,10 @@ def main():
             "{% if add_generation_prompt %}<|assistant|>\n{% endif %}"
         )
         
-    print("📦 加载模型 (Device Map Auto)...")
-    teacher_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16, device_map="auto")
-    student_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16, device_map="auto")
+    print("📦 加载模型 (使用纯血 Float32 精度防 NaN)...")
+    # 🚨 已经为你全部替换为 Float32！
+    teacher_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map="auto")
+    student_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map="auto")
     teacher_model.eval()
 
     print("\n[阶段 0/4] 测量原始满血模型的 PPL (作为无损标杆)...")
@@ -179,21 +208,29 @@ def main():
 
     PROGRESS_CKPT = "./progressive_layer_checkpoint.pt"
     num_layers = len(student_model.model.layers)
-    start_layer = 4 
+    # 因为首尾不压，我们从 Layer 0 开始扫描
+    start_layer = 0 
     is_resume = False
     ckpt = None
     
     if os.path.exists(PROGRESS_CKPT):
         print(f"\n📂 检测到中断的手术存档！读取进度坐标...")
         ckpt = torch.load(PROGRESS_CKPT, map_location="cpu")
-        start_layer = ckpt.get('next_layer', 4)
+        start_layer = ckpt.get('next_layer', 0)
         is_resume = True
 
-    print(f"\n[阶段 1/4] 🦴 正在动态搭建全网络 MPO 骨架...")
+    print(f"\n[阶段 1/4] 🦴 正在动态搭建全网络 MPO 骨架 (遵循对称 U 型保护策略)...")
     activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=32, max_len=256)
     
-    for layer_idx in range(4, num_layers):
+    # 从 0 到 31 层全盘扫描
+    for layer_idx in range(num_layers):
         ratio = custom_ratio_map.get(layer_idx, get_u_shape_ratio(layer_idx, num_layers, args.target_ratio))
+        
+        # 🚨 如果保留率是 100% (首尾层)，直接跳过不拆！
+        if ratio >= 0.99:
+            print(f"    🛡️ Layer {layer_idx} 属于首尾保护区，跳过 MPO 压缩！")
+            continue
+            
         student_layer = student_model.model.layers[layer_idx]
         NUM_CORES, LORA_RANK = 3, 32
         
@@ -225,17 +262,30 @@ def main():
                 mpo = MPOLinear(in_f, out_f, cleaned_cores, s_vector=s_vec)
                 setattr(student_layer.mlp, proj, ResMPOWrapper(mpo, in_f, out_f, LORA_RANK, lin.weight, skip_svd=False))
 
-    # 打印全局参数战报
     print_param_compression_report(teacher_model, student_model)
 
     if is_resume:
         print(f"\n📂 正在将中断前的数据安全灌入骨架中...")
         student_model.load_state_dict(ckpt['model_state_dict'], strict=False)
-        print(f"✅ 抢救成功！将直接从 Layer {start_layer} 继续起飞！")
+        
+        has_nan = False
+        for name, param in student_model.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                has_nan = True
+                break
+        if has_nan:
+            print("\n" + "!"*70)
+            print("🚨 致命警告：你读取的旧存档中包含了 NaN 毒素！")
+            print("🚨 请在终端运行命令: rm progressive_layer_checkpoint.pt")
+            print("🚨 然后重新启动本脚本！程序已自动拦截启动并退出。")
+            print("!"*70 + "\n")
+            sys.exit(1)
+            
+        print(f"✅ 安检通过，未发现 NaN 毒素！将直接从 Layer {start_layer} 继续起飞！")
         del ckpt; torch.cuda.empty_cache(); gc.collect()
 
     # ---------------------------------------------------------
-    # 阶段二：累进式局部微调
+    # 阶段二：累进式局部微调 
     # ---------------------------------------------------------
     if start_layer < num_layers:
         print(f"\n[阶段 2/4] 🧬 启动局部微调 (Teacher Forcing 绝对纯净模式)...")
@@ -243,19 +293,22 @@ def main():
         calib_inputs = [tokenizer(t, return_tensors="pt", max_length=256, truncation=True).input_ids for t in ds["text"]]
 
         for layer_idx in range(start_layer, num_layers):
+            ratio = custom_ratio_map.get(layer_idx, get_u_shape_ratio(layer_idx, num_layers, args.target_ratio))
+            # 🚨 保护层直接跳过微调！
+            if ratio >= 0.99:
+                print(f"\n ⏭️ Layer {layer_idx} 属于首尾保护层，无需局部微调，直接放行！")
+                continue
+
             student_layer = student_model.model.layers[layer_idx]
             teacher_layer = teacher_model.model.layers[layer_idx]
-            layer_device = student_layer.mlp.gate_proj.weight.device
+            layer_device = next(student_layer.parameters()).device
 
-            # ==========================================
-            # 📊 实时追踪：本层参数变化统计
-            # ==========================================
             orig_layer_params = sum(p.numel() for p in teacher_layer.mlp.parameters())
             new_layer_params = sum(p.numel() for p in student_layer.mlp.parameters())
             reduced_params = orig_layer_params - new_layer_params
             
-            print(f"\n 🎯 正在对齐 Layer {layer_idx} (Teacher-Forcing)...")
-            print(f"    ✂️ 本层刀法: 参数从 {orig_layer_params/1e6:.2f}M 降至 {new_layer_params/1e6:.2f}M (保留: {new_layer_params/orig_layer_params*100:.1f}%, 甩掉 {reduced_params/1e6:.2f}M 肥肉！)")
+            print(f"\n 🎯 正在对齐 Layer {layer_idx} 的局部特征流...")
+            print(f"    ✂️ 【瘦身战报】参数从 {orig_layer_params/1e6:.2f}M 降至 {new_layer_params/1e6:.2f}M (甩掉 {reduced_params/1e6:.2f}M 肥肉！)")
 
             cached_h_in, cached_t_out = [], []
             
@@ -270,33 +323,49 @@ def main():
                     teacher_model(input_ids.to(teacher_model.device))
             h1.remove(); h2.remove()
 
+            # =========================================================
+            # 🚨 修复后的梯度列表分配方案：彻底解决 dict AttributeError
+            # =========================================================
+            trainable_params_for_opt = []
+            raw_params_for_clip = []
+            
             for param in student_model.parameters(): param.requires_grad = False
-            trainable_params = []
+            
             for proj in ["gate_proj", "up_proj"]:
                 wrapper = getattr(student_layer.mlp, proj)
                 wrapper.lora_A.requires_grad = True; wrapper.lora_B.requires_grad = True
                 for core in wrapper.mpo.cores: core.requires_grad = True
-                trainable_params.extend([{"params": wrapper.lora_A, "lr": 1e-4}, {"params": wrapper.lora_B, "lr": 1e-4}, {"params": wrapper.mpo.cores, "lr": 1e-5}])
+                
+                # 给优化器：带 lr 的字典
+                trainable_params_for_opt.extend([
+                    {"params": wrapper.lora_A, "lr": 1e-4}, 
+                    {"params": wrapper.lora_B, "lr": 1e-4}, 
+                    {"params": wrapper.mpo.cores, "lr": 1e-5}
+                ])
+                # 给梯度裁剪：纯张量对象
+                raw_params_for_clip.extend([wrapper.lora_A, wrapper.lora_B])
+                raw_params_for_clip.extend(wrapper.mpo.cores)
             
-            optimizer = torch.optim.AdamW(trainable_params, weight_decay=0.01)
+            optimizer = torch.optim.AdamW(trainable_params_for_opt, weight_decay=0.01)
             student_layer.train()
             
             for step in range(args.local_steps):
                 idx = torch.randint(0, len(cached_h_in), (1,)).item()
-                h_in = cached_h_in[idx].to(device=layer_device, dtype=torch.bfloat16)
-                t_out = cached_t_out[idx].to(device=layer_device, dtype=torch.bfloat16)
+                # 🚨 全部使用 Float32 高精度计算！不再用 amp.autocast 降低精度！
+                h_in = cached_h_in[idx].to(device=layer_device, dtype=torch.float32)
+                t_out = cached_t_out[idx].to(device=layer_device, dtype=torch.float32)
                 
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    loss = F.mse_loss(student_layer.mlp(h_in), t_out)
-                    
+                loss = F.mse_loss(student_layer.mlp(h_in), t_out)
                 loss.backward()
                 
-                has_nan_grad = any(p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()) for p in trainable_params)
+                # 在纯张量列表里检查 NaN
+                has_nan_grad = any(p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()) for p in raw_params_for_clip)
                 if has_nan_grad:
                     optimizer.zero_grad()
                     continue
                     
-                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                # 使用纯张量列表进行梯度裁剪
+                torch.nn.utils.clip_grad_norm_(raw_params_for_clip, 1.0)
                 optimizer.step(); optimizer.zero_grad()
 
             del cached_h_in, cached_t_out; torch.cuda.empty_cache(); gc.collect()
