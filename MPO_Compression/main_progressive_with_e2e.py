@@ -229,13 +229,26 @@ def main():
                 # 🚀 修正 4：保证 s_vec 在 GPU 上且显存连续
                 s_gpu = s_vec.to(lin.weight.device).float().contiguous() if isinstance(s_vec, torch.Tensor) else float(s_vec)
 
-            # 🚀 W_perm 和 s_gpu 都在 GPU 上，可以享受毫秒级的 SVD 分解了！
+            # ============================================================
+            # 🛡️ 终极安全退守：强行把待分解的矩阵拉回 CPU！
+            # 避开 GPU SVD 的底层越界 Bug，让坚如磐石的 CPU LAPACK 库来算
+            # ============================================================
+            W_cpu_for_mpo = W_perm.detach().cpu().float()
+            
+            s_cpu_for_mpo = None
+            if s_gpu is not None:
+                s_cpu_for_mpo = s_gpu.detach().cpu().float() if isinstance(s_gpu, torch.Tensor) else float(s_gpu)
+
+            # 在 CPU 上安心分解，绝不崩溃！
             cores = factor_linear_mpo_custom(
-                W_perm, chi_ffn, NUM_CORES, out_fac, in_fac,
-                s_gpu, adaptive=True, energy_threshold=0.99
+                W_cpu_for_mpo, chi_ffn, NUM_CORES, out_fac, in_fac,
+                s_cpu_for_mpo, adaptive=True, energy_threshold=0.99
             )
 
+            # 算完之后，把切好的张量碎片安全地送回 GPU
             cleaned_cores = [c.to(device=lin.weight.device, dtype=lin.weight.dtype) for c in cores]
+            
+            # W_orig_for_res 依然留在 GPU 上，用于包装残差和后续计算
             W_orig_for_res = W_perm.to(dtype=lin.weight.dtype)
 
             mpo = MPOLinear(in_f, out_f, cleaned_cores, s_vector=s_gpu)
@@ -272,7 +285,11 @@ def main():
 
         cached_mlp_inputs = []
         def capture_hook(module, args):
-            cached_mlp_inputs.append(args[0].detach().cpu())
+            # 🚨 极速展平修复：不管原来是 [1, 192, H] 还是 [1, 126, H]
+            # 直接重塑为 [192, H] 或 [126, H] 的二维矩阵，这样 torch.cat 拼接时就畅通无阻了！
+            flattened_X = args[0].detach().cpu().reshape(-1, args[0].shape[-1])
+            cached_mlp_inputs.append(flattened_X)
+            
             # 拿到当前层的输入后，立刻抛出异常打断前向传播，绝不跑后面的层！
             raise StopForwardException
             
@@ -320,9 +337,12 @@ def main():
         # 获取 Teacher 当前层所在的具体物理显卡
         teacher_device = next(teacher_layer.parameters()).device
 
+        # ========================================================
         # 取一个小 batch 用于联合寻优
-        num_tokens = X_calib_tensor.shape[0] * X_calib_tensor.shape[1]
-        X_flat = X_calib_tensor.reshape(-1, X_calib_tensor.shape[-1])
+        # 🚨 直接把二维张量赋给 X_flat，行数就是真实的 token 数量
+        X_flat = X_calib_tensor
+        num_tokens = X_flat.shape[0]
+        # ========================================================
         
         for step in range(args.local_steps):
             optimizer.zero_grad()

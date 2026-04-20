@@ -94,9 +94,16 @@ def factor_linear_mpo_custom(
         scale = T.abs().amax()
         T_scaled = T / scale if float(scale) > 0 else T
 
+        # ========================================================
+        # 🚨 终极护盾：在送入 linalg 之前，强制清洗显存连续性！
+        # ========================================================
+        T_scaled = T_scaled.contiguous()
+        
         # QR + SVD
         try:
             Q, R = torch.linalg.qr(T_scaled, mode="reduced")
+            # R 也是新算出来的，为了保险再洗一遍
+            R = R.contiguous()
             try:
                 U_r, S, Vh = torch.linalg.svd(R, full_matrices=False, driver="gesvd")
             except TypeError:
