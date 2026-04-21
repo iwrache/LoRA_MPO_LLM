@@ -28,15 +28,29 @@ def get_activation_scales(model, tokenizer, num_samples=64, max_len=512):
     scales = {}
     handles = []
 
-    # 2. 定义 Hook 函数
+    # 2. 定义 Hook 函数 (升级为 Hessian/RMS 追踪)
     def get_hook(name):
         def hook(module, inp, out):
-            x = inp[0].detach()
-            x_max = x.abs().view(-1, x.shape[-1]).max(dim=0)[0]
+            # 将输入特征展平为 [Total_Tokens, Hidden_Dim]
+            x = inp[0].detach().view(-1, inp[0].shape[-1]).float()
+            
+            # 🚀 核心升级：计算每个通道特征的平方和 (x^2)
+            # 这等价于海森矩阵 (H = X^T X) 的对角线元素！
+            x_sq_sum = (x ** 2).sum(dim=0)
+            
+            # 我们累加总的平方和，并在外层最后处理时取平均和开根号
+            # 为了在这个 hook 里保持简单，我们先只累加。
+            # 为了不破坏外部已有的逻辑，我们这里依然返回累加后的均方根
+            
+            num_tokens_in_batch = x.shape[0]
+            
             if name not in scales:
-                scales[name] = x_max
+                # 初始化：保存 [累加的平方和, 累加的 token 数量]
+                scales[name] = [x_sq_sum, num_tokens_in_batch]
             else:
-                scales[name] = torch.maximum(scales[name], x_max)
+                # 累加：平方和相加，token 数量相加
+                scales[name][0] += x_sq_sum
+                scales[name][1] += num_tokens_in_batch
         return hook
 
     # 3. 给模型中所有的 nn.Linear 挂载 Hook
@@ -56,4 +70,15 @@ def get_activation_scales(model, tokenizer, num_samples=64, max_len=512):
         h.remove()
 
     print(f"    -> [Calibration] 成功提取了 {len(scales)} 个 Linear 层的缩放向量。")
-    return scales
+    # =================================================================
+    # 🚀 在返回前，把累加的平方和计算成最终的 RMS (Hessian 对角线近似)
+    # 公式： RMS = sqrt( sum(x^2) / total_tokens + epsilon )
+    # =================================================================
+    final_scales = {}
+    for name, (sq_sum, total_tokens) in scales.items():
+        # 除以总 token 数得到均方，然后开根号，加上 1e-8 防止除零
+        rms_scale = torch.sqrt(sq_sum / total_tokens + 1e-8)
+        final_scales[name] = rms_scale
+        
+    print(f"    -> [Calibration] 成功提取了 {len(final_scales)} 个 Linear 层的 Hessian (RMS) 缩放向量。")
+    return final_scales

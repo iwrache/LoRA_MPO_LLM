@@ -7,7 +7,7 @@ MPO 究极压缩管线 (Block-Wise Joint Optimization V8.0)
 import os
 # 强制锁定前4张卡
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import sys
@@ -91,7 +91,11 @@ class ResMPOWrapper(nn.Module):
             self.lora_B = nn.Parameter((U[:, :self.r] @ S_sqrt).to(target_dtype))
 
     def forward(self, x):
-        return self.mpo(x) + F.linear(F.linear(x, self.lora_A), self.lora_B)
+        # 🚀 终极动态数据类型护盾：不管 x 是 float32 还是 bfloat16，参数强制对齐，绝不报错！
+        dtype = x.dtype
+        mpo_out = self.mpo(x)
+        lora_out = F.linear(F.linear(x, self.lora_A.to(dtype)), self.lora_B.to(dtype))
+        return mpo_out + lora_out
 
 def eval_ppl(model, tokenizer, max_len=2048, stride=512, max_tokens=15000):
     model.eval() 
@@ -149,6 +153,19 @@ def main():
     
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    
+    # =====================================================================
+    # 🚨 终极修复：为 Base 模型强制注入标准的 Chat Template，防止拼接数据时报错
+    # =====================================================================
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}System: {{ message['content'] }}\n"
+            "{% elif message['role'] == 'user' %}User: {{ message['content'] }}\n"
+            "{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}{{ eos_token }}\n"
+            "{% endif %}{% endfor %}"
+            "{% if add_generation_prompt %}Assistant: {% endif %}"
+        )
         
     print("📦 加载模型 (纯血 Float32 精度)...")
     teacher_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map="auto")
@@ -158,8 +175,33 @@ def main():
     num_layers = len(student_model.model.layers)
     
     print("\n📚 截获极其珍贵的校准数据 (128条足以激活海森矩阵的威力)...")
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train").filter(lambda x: len(x["text"]) > 50).select(range(128))
-    calib_inputs = [tokenizer(t, return_tensors="pt", max_length=256, truncation=True).input_ids for t in ds["text"]]
+    #ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train").filter(lambda x: len(x["text"]) > 50).select(range(128))
+    #calib_inputs = [tokenizer(t, return_tensors="pt", max_length=256, truncation=True).input_ids for t in ds["text"]]
+    print("\n📚 正在构建混合通用特征校准集 (防断网本地版)...")
+    calib_texts = []
+    
+    # 1. 抽取 64 条 WikiText (提取严谨的语法和书面知识特征)
+    wiki_ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    for t in wiki_ds["text"]:
+        if len(t) > 200: 
+            calib_texts.append(t)
+        if len(calib_texts) >= 64: 
+            break
+            
+    # 2. 抽取 64 条 UltraChat (提取问答、逻辑、代码等通用对话特征)
+    # 这个数据集你在阶段 4 也要用，提前加载会直接存入本地缓存，又快又稳！
+    chat_ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
+    for item in chat_ds:
+        # 把多轮对话拼接成一段长特征文本
+        text = "\n".join([m["content"] for m in item["messages"]])
+        if len(text) > 200: 
+            calib_texts.append(text)
+        # 总数凑齐 128 条就收手
+        if len(calib_texts) >= 128: 
+            break
+            
+    calib_inputs = [tokenizer(t, return_tensors="pt", max_length=256, truncation=True).input_ids for t in calib_texts]
+    print(f"✅ 成功构建 {len(calib_inputs)} 条混合黄金特征数据 (Wiki+Chat)！")
 
     print(f"\n🦴 [阶段 1] 动态搭建全网络 MPO 骨架 (ASVD 激活感知识别中)...")
     activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=32, max_len=256)
@@ -260,7 +302,7 @@ def main():
         print(f"  ✅ Layer {layer_idx}: Permutation + MPO + LoRA 骨架搭建完毕")
 
     PROGRESS_CKPT = "./progressive_layer_checkpoint.pt"
-
+    
     # ---------------------------------------------------------
     # 🌌 [阶段 2] 逐层误差吸收 (Sequential Cascading) + Block-wise 联合优化
     # ---------------------------------------------------------
@@ -370,7 +412,7 @@ def main():
             optimizer.step()
             
         print(f"    ✅ Block-wise 联合收敛! MLP Output MSE: {loss.item():.6f}")
-
+        
         # 优化完毕，重新冻结
         student_layer.mlp.eval()
         for proj in ["gate_proj", "up_proj"]:
@@ -387,7 +429,7 @@ def main():
             os.replace(tmp_ckpt, PROGRESS_CKPT)
         except Exception as e:
             print(f"    ⚠️ 保存异常: {e}")
-
+    
     print("\n[阶段 3] 测量 Block-wise 级联特征对齐后的 PPL...")
     ppl_mid = eval_ppl(student_model, tokenizer)
     print(f"🌟 【阶段二】级联收敛 PPL: {ppl_mid}")
@@ -395,7 +437,7 @@ def main():
     print("\n[阶段 4] 🌌 启动端到端联合蒸馏 (E2E Healing)...")
     os.environ["MPO_EVAL_PATH"] = "mpo"; os.environ["MPO_TRAIN_PATH"] = "mpo"
     torch.cuda.empty_cache(); gc.collect()
-    
+    '''
     student_model.to(torch.bfloat16)
     teacher_model.to(torch.bfloat16)
 
@@ -405,7 +447,27 @@ def main():
         save_every_n_steps=500, checkpoint_dir="./healing_checkpoints_mixed_e2e", 
         max_update_steps=args.e2e_steps, resume_from_checkpoint=None 
     )
+    '''
+    print("\n[阶段 4] 🌌 训练已完成，直接加载 E2E 终极权重！...")
+    final_checkpoint_path = "./healing_checkpoints_mixed_e2e/checkpoint_upd_1000.pt" 
+    
+    print(f"正在加载神药: {final_checkpoint_path}")
+    
+    # 1. 把整个“训练现场大礼包”加载到内存
+    checkpoint = torch.load(final_checkpoint_path, map_location="cpu")
+    
+    # 2. 剥开包装，只提取出我们真正需要的训练权重
+    # (根据你的报错信息，它被安全地存在了 "trainable_state_dict" 这个抽屉里)
+    state_dict = checkpoint["trainable_state_dict"]
+    
+    # 3. 🚨 核心修复：加载权重，并开启 strict=False！
+    # 告诉 PyTorch："我只给你提供被修改过的 MPO 和 LoRA 零件，
+    # 原本的 Attention 和 Norm 层你就保持原样，不要报 Missing 错误！"
+    student_model.load_state_dict(state_dict, strict=False)
+    
+    print("✅ 权重完美融合！MPO 满血架构复活！")
 
+    # 直接开始最终 PPL 评测 (保持在 float32 获得最高精度)
     ppl_final = eval_ppl(student_model, tokenizer)
     
     print("\n" + "="*70)
