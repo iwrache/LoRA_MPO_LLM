@@ -37,11 +37,8 @@ def evaluate_ppl(model, tokenizer, dataset_name, max_seq_len=2048, stride=512):
     model.eval()
 
     # ---------- 确定输入设备 ----------
-    if hasattr(model, "hf_device_map"):
-        device = torch.device("cuda:0")          # device_map="auto" 时用 cuda:0
-    else:
-        device = next(model.parameters()).device
-
+    device = model.model.embed_tokens.weight.device
+    
     print(f"\n{'='*55}")
     print(f"  📐 评测 {dataset_name.upper()} Perplexity")
     print(f"{'='*55}")

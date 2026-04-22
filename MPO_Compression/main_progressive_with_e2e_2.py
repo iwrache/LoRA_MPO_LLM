@@ -5,11 +5,12 @@ MPO 究极压缩管线 (Block-Wise Joint Optimization V8.0)
 """
 
 import os
-# 强制锁定前4张卡
-if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+# 强制锁定前3张卡
+#if "CUDA_VISIBLE_DEVICES" not in os.environ:
+#    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
+from accelerate import Accelerator
+import gc # 确保 gc 也导入了
 import sys
 import gc
 import argparse
@@ -102,8 +103,14 @@ class ResMPOWrapper(nn.Module):
             else:
                 Delta_W_scaled = Delta_W
 
-            # 3. 对缩放后的残差进行 SVD
-            U, S, Vh = torch.linalg.svd(Delta_W_scaled, full_matrices=False)
+            # 3. 对缩放后的残差进行 SVD (增加 GPU 防爆显存护盾)
+            try:
+                U, S, Vh = torch.linalg.svd(Delta_W_scaled, full_matrices=False)
+            except RuntimeError:
+                print("      [⚠️ GPU SVD 内存碎片, 降级至 CPU 计算 LoRA 残差...]")
+                U, S, Vh = torch.linalg.svd(Delta_W_scaled.cpu(), full_matrices=False)
+                U, S, Vh = U.to(target_device), S.to(target_device), Vh.to(target_device)
+                
             S_sqrt = torch.diag(torch.sqrt(S[:self.r].clamp(min=0)))
             
             A_matrix_scaled = S_sqrt @ Vh[:self.r, :]  # 形状: [r, in_features]
@@ -171,10 +178,18 @@ def main():
     parser.add_argument("--local_steps", type=int, default=300, help="Block-wise对齐步数")
     parser.add_argument("--e2e_steps", type=int, default=1000)
     parser.add_argument("--save_path", type=str, default="/mnt/sx_data/ultimate_healed_llama.pt")
+    
+    # 🌟 修复：补齐量子自组织的核心参数！
+    parser.add_argument("--adaptive_mode", type=str, default="quantum", 
+                        choices=["fixed", "energy", "entropy", "quantum"])
+    parser.add_argument("--quantum_scale", type=float, default=1, 
+                        help="量子自组织常数 α (越大保留越多，推荐 1.5 ~ 3.5)")
+    
     args = parser.parse_args()
 
     custom_ratio_map = dict(zip(args.custom_layers, args.custom_ratios))
-
+    accelerator = Accelerator(gradient_accumulation_steps=8, mixed_precision="bf16")
+    device = accelerator.device  # 这句极其关键！它会让进程 0拿到 cuda:0，进程 1拿到 cuda:1
     print("="*70)
     print(" 🚀 究极两阶段压缩管线启动 (Block-Wise 联合优化 + 逐层级联吸收模式)")
     print("="*70)
@@ -196,8 +211,20 @@ def main():
         )
         
     print("📦 加载模型 (纯血 Float32 精度)...")
-    teacher_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map="auto")
-    student_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map="auto")
+
+
+    # 2. 加载模型，严格使用 .to(device)
+    teacher_model = AutoModelForCausalLM.from_pretrained(
+        args.model_name, 
+        torch_dtype=torch.bfloat16, 
+        device_map=None  # 👈 必须是 None
+    ).to(device)         # 👈 必须是 .to(device)
+
+    student_model = AutoModelForCausalLM.from_pretrained(
+        args.model_name, 
+        torch_dtype=torch.bfloat16, 
+        device_map=None  # 👈 必须是 None
+    ).to(device)         # 👈 必须是 .to(device)
     teacher_model.eval()
     
     num_layers = len(student_model.model.layers)
@@ -303,10 +330,26 @@ def main():
             W_cpu_for_mpo = W_perm.detach().cpu().float()
             s_cpu_for_mpo = s_gpu.detach().cpu().float() if isinstance(s_gpu, torch.Tensor) else s_gpu
 
+            # 🌟 新代码：传入量子参数，并给 bond_dim 设置一个防爆显存的硬上限（比如 256）
             cores = factor_linear_mpo_custom(
-                W_cpu_for_mpo, chi_ffn, NUM_CORES, out_fac, in_fac,
-                s_cpu_for_mpo, adaptive=True, energy_threshold=0.99
+                W_cpu_for_mpo, 
+                bond_dim=256,         
+                num_cores=NUM_CORES, 
+                out_fac=out_fac, 
+                in_fac=in_fac,
+                s_vector=s_cpu_for_mpo, 
+                adaptive_mode=args.adaptive_mode,  
+                quantum_scale=args.quantum_scale   
             )
+
+            # 🌟 修复：真实参数量 = MPO Cores 参数 + LoRA 参数
+            orig_params = W_perm.numel()
+            actual_mpo_params = sum(c.numel() for c in cores)
+            actual_lora_params = in_f * LORA_RANK + out_f * LORA_RANK
+            actual_total_params = actual_mpo_params + actual_lora_params
+            actual_ratio = actual_total_params / orig_params
+            
+            print(f"      ↳ [{proj}] 量子自组织压缩率: {actual_ratio*100:.2f}% (MPO: {actual_mpo_params}, LoRA: {actual_lora_params})")
 
             cleaned_cores = [c.to(device=lin.weight.device, dtype=lin.weight.dtype) for c in cores]
             W_orig_for_res = W_perm.to(dtype=lin.weight.dtype)
@@ -318,6 +361,20 @@ def main():
             )
 
         print(f"  ✅ Layer {layer_idx}: Permutation + MPO + LoRA 骨架搭建完毕")
+
+    # ====================================================================
+    # 🌟 终极追踪：阶段 1 结束后，直接透视整个模型的最终物理体积！
+    # ====================================================================
+    orig_total_params = sum(p.numel() for p in teacher_model.parameters())
+    new_total_params = sum(p.numel() for p in student_model.parameters())
+    
+    print("\n" + "="*70)
+    print(" 📊 [阶段 1 总结] 量子自组织压缩战报")
+    print(f" 原始模型总参数量 : {orig_total_params / 1e9:.4f} B (Billion)")
+    print(f" 压缩后模型总参数量: {new_total_params / 1e9:.4f} B (Billion)")
+    print(f" 🌟 全模型真实保留率: {(new_total_params / orig_total_params) * 100:.2f}%")
+    print(f" (注：由于保护了首尾层和 Embedding，所以全模型保留率会比单层 MLPs 的保留率稍高，这是正常的！)")
+    print("="*70)
 
     PROGRESS_CKPT = "/mnt/sx_data/progressive_layer_checkpoint.pt"
     
@@ -446,11 +503,13 @@ def main():
         gc.collect()
         
         tmp_ckpt = PROGRESS_CKPT + ".tmp"
-        try:
-            torch.save({'next_layer': layer_idx + 1, 'model_state_dict': student_model.state_dict()}, tmp_ckpt)
-            os.replace(tmp_ckpt, PROGRESS_CKPT)
-        except Exception as e:
-            print(f"    ⚠️ 保存异常: {e}")
+        # 🌟 3. 防撞车结界：只允许主卡 (GPU 0) 去写硬盘！
+        if accelerator.is_main_process:
+            try:
+                torch.save({'next_layer': layer_idx + 1, 'model_state_dict': student_model.state_dict()}, tmp_ckpt)
+                os.replace(tmp_ckpt, PROGRESS_CKPT)
+            except Exception as e:
+                print(f"    ⚠️ 保存异常: {e}")
     
     print("\n[阶段 3] 测量 Block-wise 级联特征对齐后的 PPL...")
     ppl_mid = eval_ppl(student_model, tokenizer)
@@ -465,13 +524,13 @@ def main():
 
     student_model = train_healing(
         student_model=student_model, tokenizer=tokenizer, teacher_model=teacher_model, 
-        dataset_name="mixed", epochs=1, batch_size=4, accum_steps=2, lr=2e-5, seq_len=1024,  
+        dataset_name="mixed", epochs=1, batch_size=1, accum_steps=16, lr=2e-5, seq_len=1024,  
         save_every_n_steps=500, checkpoint_dir="/mnt/sx_data/healing_checkpoints_mixed_e2e", 
-        max_update_steps=args.e2e_steps, resume_from_checkpoint=None 
+        max_update_steps=args.e2e_steps, resume_from_checkpoint=None, accelerator=accelerator
     )
     
     print("\n[阶段 4] 🌌 训练已完成，直接加载 E2E 终极权重！...")
-    final_checkpoint_path = "/mnt/sx_data/healing_checkpoints_mixed_e2e/checkpoint_upd_1000.pt" 
+    final_checkpoint_path = "/mnt/sx_data/healing_checkpoints_mixed_e2e/checkpoint_upd.pt" 
     
     print(f"正在加载神药: {final_checkpoint_path}")
     

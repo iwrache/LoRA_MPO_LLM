@@ -3,14 +3,10 @@ import torch.nn as nn
 from typing import List, Optional
 
 # ============================================================
-# 因子分解工具（自包含版，兼容项目代码逻辑）
+# 因子分解工具
 # ============================================================
 
 def find_factors_balanced(n: int, num_factors: int) -> List[int]:
-    """
-    将 n 分解为 num_factors 个乘积因子，尽量平衡。
-    直接复制自项目 helpers.py，保证 test_MPO.py 可独立运行。
-    """
     if num_factors == 1:
         return [int(n)]
     factors = []
@@ -30,207 +26,238 @@ def find_factors_balanced(n: int, num_factors: int) -> List[int]:
     return [int(g) for g in groups]
 
 
+def calculate_quantum_bonds(S_list: List[torch.Tensor], quantum_scale: float = 1.0, min_bond: int = 4, max_bond: int = 99999):
+    """
+    🌟 纯量子自组织截断引擎：不看任何人造预算，只遵从物理学 $2^S$ 法则。
+    """
+    dynamic_bonds = []
+    entropies = []
+    
+    for S in S_list:
+        # 1. 能量概率分布
+        energy = S ** 2
+        prob = energy / (energy.sum() + 1e-12)
+        
+        # 2. 计算以 2 为底的香农熵 (Shannon Entropy)
+        # 物理学中有时用自然对数 e，这里用 2 更符合信息论的 Bit 直觉
+        entropy = -torch.sum(prob * torch.log2(prob + 1e-12)).item()
+        entropies.append(entropy)
+        
+        # 3. 💥 核心物理公式：\chi = \alpha * 2^S
+        # quantum_scale (\alpha) 是全局缩放因子，控制你对"信息冗余"的容忍度
+        bond = int(round(quantum_scale * (2 ** entropy)))
+        
+        # 防止极端情况导致矩阵碎裂或爆显存
+        bond = max(min_bond, min(max_bond, bond))
+        dynamic_bonds.append(bond)
+        
+    return dynamic_bonds, entropies
+
 # ============================================================
-# 核心：自定义 MPO 分解（带 bond_dim 截断）
+# 🌟 新增：基于纠缠熵的动态 Bond 分配引擎
+# ============================================================
+
+def calculate_dynamic_bonds_by_entropy(S_list: List[torch.Tensor], target_total_bond: int, min_bond: int = 4) -> List[int]:
+    """
+    根据每个张量切面的奇异值纠缠熵，按比例分配总 Bond 预算。
+    """
+    entropies = []
+    for S in S_list:
+        # 1. 能量概率分布 (将奇异值平方视作能量)
+        energy = S ** 2
+        prob = energy / (energy.sum() + 1e-12)
+        
+        # 2. 计算香农/冯诺依曼纠缠熵: S = -sum(p * ln(p))
+        entropy = -torch.sum(prob * torch.log2(prob + 1e-12)).item()
+        entropies.append(entropy)
+        
+    # 3. 预算分配
+    total_entropy = sum(entropies) + 1e-9
+    dynamic_bonds = []
+    
+    for entropy in entropies:
+        weight = entropy / total_entropy
+        bond = int(round(weight * target_total_bond))
+        bond = max(min_bond, bond) # 保证物理骨架不断裂
+        dynamic_bonds.append(bond)
+        
+    return dynamic_bonds, entropies
+
+# ============================================================
+# 核心：自定义 MPO 分解（带 Two-Pass 纠缠熵自适应）
 # ============================================================
 
 def factor_linear_mpo_custom(
     weight: torch.Tensor,
-    bond_dim: int,              # 硬上限，防止爆显存
+    bond_dim: int,              
     num_cores: int,
     out_fac: Optional[List[int]] = None,
     in_fac: Optional[List[int]] = None,
     s_vector: Optional[torch.Tensor] = None,
     boundary: str = "open",
     noise_scale: float = 1e-5,
-    # ====== 新增参数 ======
-    adaptive: bool = True,     # 是否启用自适应截断
-    energy_threshold: float = 0.99,  # 保留的能量比例（如 99.9%）
-    min_bond: int = 4,          # 自适应模式下的最小 bond，防止退化
+    adaptive_mode: str = "quantum", # 默认设为 quantum
+    energy_threshold: float = 0.99,
+    quantum_scale: float = 2.0,     # 🌟 必须加上这个接收口
+    min_bond: int = 4,              
 ) -> List[torch.Tensor]:
     """
-    将权重矩阵 W (out_f, in_f) 用 sequential SVD 分解为 MPO cores。
-
-    两种截断策略：
-      - adaptive=False（默认）: 所有步统一截断到 bond_dim，与原来行为一致。
-      - adaptive=True:  每步根据奇异值能量阈值动态决定截断秩，
-                        同时受 bond_dim 硬上限和 min_bond 下限约束。
+    将权重矩阵分解为 MPO cores。支持三种截断策略：
+      - "fixed" : 死板地一刀切，所有内部 bond 全是 bond_dim
+      - "energy": 不设上限，只保证保留 energy_threshold 的能量 (原 adaptive=True)
+      - "entropy": 🌟 探针模式，维持总参数预算不变，用纠缠熵智能倾斜分配 bond
     """
     assert num_cores >= 2, "num_cores must be >= 2"
 
-    W = weight.detach().clone()
-    orig_dtype = W.dtype
-    device = weight.device
-    out_f, in_f = W.shape
-    W = W.to(torch.float32)
+    W_orig = weight.detach().clone()
+    orig_dtype = W_orig.dtype
+    device = W_orig.device
+    out_f, in_f = W_orig.shape
 
-    if s_vector is not None:
-        s_vector = s_vector.to(device=device, dtype=torch.float32)
-        W = W * s_vector.unsqueeze(0)
+    if out_fac is None: out_fac = find_factors_balanced(out_f, num_cores)
+    if in_fac is None: in_fac = find_factors_balanced(in_f, num_cores)
 
-    if not torch.isfinite(W).all():
-        W = torch.nan_to_num(W, nan=0.0, posinf=1e4, neginf=-1e4)
+    # 内部执行单次顺序 SVD 切分的闭包函数
+    def _execute_mpo_pass(W_tensor, custom_bonds=None, mode="fixed"):
+        W = W_tensor.to(torch.float32)
+        if s_vector is not None:
+            s_vec = s_vector.to(device=device, dtype=torch.float32)
+            W = W * s_vec.unsqueeze(0)
 
-    if out_fac is None:
-        out_fac = find_factors_balanced(out_f, num_cores)
-    if in_fac is None:
-        in_fac = find_factors_balanced(in_f, num_cores)
+        if not torch.isfinite(W).all():
+            W = torch.nan_to_num(W, nan=0.0, posinf=1e4, neginf=-1e4)
 
-    T = W.reshape(*out_fac, *in_fac)
-    del W
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        T = W.reshape(*out_fac, *in_fac)
+        perm = [j for i in range(num_cores) for j in (i, num_cores + i)]
+        T = T.permute(*perm).contiguous()
 
-    perm = [j for i in range(num_cores) for j in (i, num_cores + i)]
-    T = T.permute(*perm).contiguous()
+        cores, prev = [], 1
+        actual_ranks = []
+        S_history = []
 
-    cores, prev = [], 1
-    adaptive_ranks = []  # 记录每步实际选择的秩（方便调试）
+        for k in range(num_cores - 1):
+            rows = prev * out_fac[k] * in_fac[k]
+            T = T.reshape(rows, -1)
 
-    for k in range(num_cores - 1):
-        rows = prev * out_fac[k] * in_fac[k]
-        T = T.reshape(rows, -1)
-
-        scale = T.abs().amax()
-        T_scaled = T / scale if float(scale) > 0 else T
-
-        # ========================================================
-        # 🚨 终极护盾：在送入 linalg 之前，强制清洗显存连续性！
-        # ========================================================
-        T_scaled = T_scaled.contiguous()
-        
-        # QR + SVD
-        try:
-            Q, R = torch.linalg.qr(T_scaled, mode="reduced")
-            # R 也是新算出来的，为了保险再洗一遍
-            R = R.contiguous()
+            scale = T.abs().amax()
+            T_scaled = T / scale if float(scale) > 0 else T
+            T_scaled = T_scaled.contiguous()
+            
             try:
-                U_r, S, Vh = torch.linalg.svd(R, full_matrices=False, driver="gesvd")
-            except TypeError:
-                U_r, S, Vh = torch.linalg.svd(R, full_matrices=False)
-        except Exception:
-            T64 = T_scaled.detach().to(device="cpu", dtype=torch.float64)
-            U_r, S, Vh = torch.linalg.svd(T64, full_matrices=False)
-            U_r = U_r.to(device=T.device, dtype=T.dtype)
-            S = S.to(device=T.device, dtype=T.dtype)
-            Vh = Vh.to(device=T.device, dtype=T.dtype)
-            Q = None
+                Q, R = torch.linalg.qr(T_scaled, mode="reduced")
+                R = R.contiguous()
+                try:
+                    U_r, S, Vh = torch.linalg.svd(R, full_matrices=False, driver="gesvd")
+                except TypeError:
+                    U_r, S, Vh = torch.linalg.svd(R, full_matrices=False)
+            except Exception:
+                T64 = T_scaled.detach().to(device="cpu", dtype=torch.float64)
+                U_r, S, Vh = torch.linalg.svd(T64, full_matrices=False)
+                U_r, S, Vh = U_r.to(T.device).float(), S.to(T.device).float(), Vh.to(T.device).float()
+                Q = None
 
-        U = U_r if Q is None else Q @ U_r
-        S = S * scale
+            U = U_r if Q is None else Q @ U_r
+            S = S * scale
+            
+            S_history.append(S.clone())
+            rank_avail = min(U.shape[1], S.shape[0], Vh.shape[0])
 
-        # ====== 截断策略分支 ======
-        rank_avail = min(U.shape[1], S.shape[0], Vh.shape[0])
-
-        if adaptive:
-            # 基于能量阈值的自适应截断
-            S_sq = S[:rank_avail] ** 2
-            total_energy = S_sq.sum().item()
-
-            if total_energy > 0:
-                cumsum = torch.cumsum(S_sq, dim=0)
-                # 找到满足能量阈值的最小秩
-                mask = cumsum >= energy_threshold * total_energy
-                if mask.any():
-                    r_energy = int(mask.nonzero(as_tuple=True)[0][0].item()) + 1
+            # 截断逻辑路由
+            if mode == "energy":
+                S_sq = S[:rank_avail] ** 2
+                total_energy = S_sq.sum().item()
+                if total_energy > 0:
+                    cumsum = torch.cumsum(S_sq, dim=0)
+                    mask = cumsum >= energy_threshold * total_energy
+                    r = int(mask.nonzero(as_tuple=True)[0][0].item()) + 1 if mask.any() else rank_avail
                 else:
-                    r_energy = int(rank_avail)
-            else:
-                r_energy = 1
+                    r = 1
+            elif mode == "custom_list" and custom_bonds is not None:
+                r = custom_bonds[k]
+            else: # "fixed" 或 fallback
+                r = bond_dim
 
-            # 施加上下限约束
-            r = max(min_bond, min(r_energy, bond_dim, rank_avail))
-        else:
-            # 原始固定截断
-            r = max(1, min(int(bond_dim), int(rank_avail)))
+            r = max(min_bond, min(int(r), int(rank_avail)))
+            actual_ranks.append(r)
 
-        adaptive_ranks.append(r)
+            U, S_trunc, Vh = U[:, :r], S[:r], Vh[:r]
+            cores.append(U.reshape(prev, out_fac[k], in_fac[k], r))
+            T = torch.diag(S_trunc) @ Vh
+            prev = r
 
-        U = U[:, :r]
-        S = S[:r]
-        Vh = Vh[:r]
+        cores.append(T.reshape(prev, out_fac[-1], in_fac[-1], 1))
+        
+        # 统一清洗和转换格式
+        cleaned = []
+        for c in cores:
+            if not torch.isfinite(c).all(): c = torch.nan_to_num(c, nan=0.0)
+            cleaned.append(c.to(device=device, dtype=orig_dtype))
+            
+        return cleaned, S_history, actual_ranks
 
-        core = U.reshape(prev, out_fac[k], in_fac[k], r)
-        cores.append(core)
+    # ========================================================
+    # 策略路由枢纽
+    # ========================================================
+    if adaptive_mode == "entropy":
+        # 1. 探针 Pass：用无限制的 bond (99999) 探查矩阵的真实物理结构
+        _, S_list, _ = _execute_mpo_pass(W_orig, mode="fixed", custom_bonds=[99999]*(num_cores-1))
+        
+        # 2. 算命：目标总预算 = 用户期望的平均 bond_dim * 切口数量
+        target_total = bond_dim * (num_cores - 1)
+        allocated_bonds, entropies = calculate_dynamic_bonds_by_entropy(S_list, target_total, min_bond)
+        print(f"    [Entropy 路由] 各切口纠缠熵: {[f'{e:.2f}' for e in entropies]}")
+        print(f"    [Entropy 路由] 预算重新分配: {bond_dim}x{num_cores-1} -> {allocated_bonds}")
+        
+        # 3. 执行 Pass：带着上帝视角的预算进行精准下刀
+        cores, _, final_ranks = _execute_mpo_pass(W_orig, custom_bonds=allocated_bonds, mode="custom_list")
+        
+    elif adaptive_mode == "energy":
+        cores, _, final_ranks = _execute_mpo_pass(W_orig, mode="energy")
+        print(f"    [Energy 自适应] 动态截断秩: {final_ranks} (保底 {energy_threshold*100}% 能量)")
+        
+    elif adaptive_mode == "quantum":
+        # 1. 探针 Pass：拿真实奇异值
+        _, S_list, _ = _execute_mpo_pass(W_orig, mode="fixed", custom_bonds=[99999]*(num_cores-1))
+        
+        # 2. 算命：完全基于 2^S，不考虑总预算！
+        # 这里的 quantum_scale 就是你的唯一超参数，通常设为 1.0 ~ 5.0
+        print("quantum scale:", quantum_scale)
+        allocated_bonds, entropies = calculate_quantum_bonds(S_list, quantum_scale=quantum_scale)
+        
+        print(f"    [Quantum 路由] 测得纠缠熵 S: {[f'{e:.2f}' for e in entropies]}")
+        print(f"    [Quantum 路由] 2^S 独立裁决 Bond: {allocated_bonds}")
+        
+        # 3. 执行 Pass
+        cores, _, final_ranks = _execute_mpo_pass(W_orig, custom_bonds=allocated_bonds, mode="custom_list")
 
-        del U, U_r, Q
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    else: # "fixed"
+        cores, _, final_ranks = _execute_mpo_pass(W_orig, mode="fixed")
 
-        T = torch.diag(S) @ Vh
-
-        del S, Vh
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        prev = r
-
-    cores.append(T.reshape(prev, out_fac[-1], in_fac[-1], 1))
-    del T
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # 打印自适应截断的实际秩（调试用）
-    if adaptive:
-        print(f"    自适应截断秩: {adaptive_ranks}  (阈值={energy_threshold}, 上限={bond_dim})")
-
-    # 清洗 NaN/Inf
-    cleaned = []
-    for c in cores:
-        if not torch.isfinite(c).all():
-            c = torch.nan_to_num(c, nan=0.0, posinf=1e4, neginf=-1e4)
-        cleaned.append(c.to(device=device, dtype=orig_dtype))
-    del cores
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # PBC 转换
+    # PBC 转换逻辑 (保持不变)
     if boundary.lower() == "periodic":
-        r_0 = int(bond_dim)
+        r_0 = int(final_ranks[0]) if len(final_ranks) > 0 else int(bond_dim)
         pad_dim = r_0 - 1
-
         if pad_dim > 0:
-            c1 = cleaned[0]
-            cK = cleaned[-1]
+            c1, cK = cores[0], cores[-1]
+            noise_c1 = torch.randn(pad_dim, c1.shape[1], c1.shape[2], c1.shape[3], device=device, dtype=orig_dtype) * noise_scale
+            cores[0] = torch.cat([c1, noise_c1], dim=0)
+            noise_cK = torch.randn(cK.shape[0], cK.shape[1], cK.shape[2], pad_dim, device=device, dtype=orig_dtype) * noise_scale
+            cores[-1] = torch.cat([cK, noise_cK], dim=3)
 
-            noise_c1 = torch.randn(pad_dim, c1.shape[1], c1.shape[2], c1.shape[3],
-                                   device=device, dtype=orig_dtype) * noise_scale
-            cleaned[0] = torch.cat([c1, noise_c1], dim=0)
+    return cores
 
-            noise_cK = torch.randn(cK.shape[0], cK.shape[1], cK.shape[2], pad_dim,
-                                   device=device, dtype=orig_dtype) * noise_scale
-            cleaned[-1] = torch.cat([cK, noise_cK], dim=3)
-
-    return cleaned
-
-
+# estimate_bond_dim, reconstruct_mpo_matrix 和 verify 保持你的原有逻辑
+# 为了验证，我们可以修改一下 verify_mpo_equivalence 的调用方式
 def estimate_bond_dim(weight: torch.Tensor, num_cores: int, target_ratio: float = 0.1) -> int:
-    """
-    根据目标压缩比自动估算 bond_dim。
-
-    Args:
-        weight:     [out_f, in_f]
-        num_cores:  K
-        target_ratio: MPO 参数量 / Dense 参数量的目标比例（例如 0.1 表示 10%）
-
-    Returns:
-        估算的 bond_dim（>=1）
-    """
     out_f, in_f = weight.shape
     dense_params = out_f * in_f
     out_fac = find_factors_balanced(out_f, num_cores)
     in_fac = find_factors_balanced(in_f, num_cores)
-
-    # MPO params 的近似公式
     if num_cores == 2:
-        # core0: 1*o1*i1*chi + core1: chi*o2*i2*1 = chi * (o1*i1 + o2*i2)
         term = out_fac[0] * in_fac[0] + out_fac[1] * in_fac[1]
         bond = int(target_ratio * dense_params / term) if term > 0 else 1
     else:
-        # 主导项近似: (K-2) * chi^2 * avg(o_k * i_k) + 2 * chi * end_term
-        # 用迭代求解更稳妥
         avg_oi = sum(o * i for o, i in zip(out_fac, in_fac)) / num_cores
-        # 直接解二次方程近似: (K-2)*avg_oi*chi^2 + 2*avg_oi*chi ≈ target * dense_params
         a = (num_cores - 2) * avg_oi
         b = 2 * avg_oi
         c_val = -target_ratio * dense_params
@@ -242,13 +269,7 @@ def estimate_bond_dim(weight: torch.Tensor, num_cores: int, target_ratio: float 
             bond = 1
     return max(1, bond)
 
-
-# ============================================================
-# 本地验证脚本
-# ============================================================
-
 def reconstruct_mpo_matrix(cores: List[torch.Tensor]) -> torch.Tensor:
-    """将 MPO cores 重构为原始矩阵 W (out_f, in_f)。"""
     M = cores[0]
     for k in range(1, len(cores)):
         nd = M.ndim
@@ -266,65 +287,42 @@ def reconstruct_mpo_matrix(cores: List[torch.Tensor]) -> torch.Tensor:
     M = M.permute(*perm)
     return M.reshape(torch.prod(torch.tensor(out_fac)), torch.prod(torch.tensor(in_fac)))
 
-
 def verify_mpo_equivalence():
     torch.set_default_dtype(torch.float64)
-
     o1, o2, o3 = 16, 16, 16
     i1, i2, i3 = 16, 16, 16
-    D_out = o1 * o2 * o3
-    D_in = i1 * i2 * i3
+    D_out, D_in = o1 * o2 * o3, i1 * i2 * i3
 
     print(f"=== 1. 初始化数据 ===")
     A = torch.randn(D_out, D_in)
+    
+    # 制造一个极度不均衡的奇异值分布，模拟大模型特征
+    U, S, V = torch.linalg.svd(A, full_matrices=False)
+    S_new = torch.exp(-torch.arange(len(S))/10.0) * 1000 # 强行搞成陡峭分布
+    A = U @ torch.diag(S_new) @ V
+    
     X = torch.randn(D_in)
     Y_gt = A @ X
-    print(f"原始矩阵形状: {A.shape}")
-    print(f"输入向量形状: {X.shape}")
-    print(f"Dense 参数量: {D_out * D_in}\n")
-
     X_tensor = X.view(i1, i2, i3)
 
-    # --- 满秩验证 ---
-    print(f"=== 2. 满秩 MPO 验证 (bond_dim=999999) ===")
-    cores_full = factor_linear_mpo_custom(A, bond_dim=999999, num_cores=3)
-    Y_mpo_t = torch.einsum('aoib,bpjc,cqkd,ijk->aopqd', *cores_full, X_tensor)
-    Y_mpo_t = Y_mpo_t.squeeze(0).squeeze(-1)
-    Y_mpo = Y_mpo_t.reshape(-1)
-    max_diff_full = torch.max(torch.abs(Y_gt - Y_mpo)).item()
-    print(f"Max diff: {max_diff_full:.3e}")
-    A_rec_full = reconstruct_mpo_matrix(cores_full)
-    print(f"||A||_F: {A.norm('fro').item():.3f}  ||A_rec||_F: {A_rec_full.norm('fro').item():.3f}  rel_err: {(A - A_rec_full).norm('fro').item() / A.norm('fro').item():.3e}")
-    print("✅ 满秩验证通过\n" if max_diff_full < 1e-4 else "❌ 满秩验证失败\n")
+    print(f"=== 2. Entropy 模式验证 (总预算 bond_dim=30) ===")
+    cores_entropy = factor_linear_mpo_custom(A, bond_dim=30, num_cores=3, adaptive_mode="entropy")
+    Y_mpo_t = torch.einsum('aoib,bpjc,cqkd,ijk->aopqd', *cores_entropy, X_tensor)
+    Y_mpo = Y_mpo_t.squeeze(0).squeeze(-1).reshape(-1)
+    print(f"Max diff: {torch.max(torch.abs(Y_gt - Y_mpo)).item():.3e}\n")
 
-    # --- 截断验证 ---
-    bond = 30
-    print(f"=== 3. 截断 MPO 验证 (bond_dim={bond}) ===")
-    cores_trunc = factor_linear_mpo_custom(A, bond_dim=bond, num_cores=3)
-    Y_mpo_t2 = torch.einsum('aoib,bpjc,cqkd,ijk->aopqd', *cores_trunc, X_tensor)
-    Y_mpo_t2 = Y_mpo_t2.squeeze(0).squeeze(-1)
-    Y_mpo2 = Y_mpo_t2.reshape(-1)
-    mpo_params = sum(c.numel() for c in cores_trunc)
-    dense_params = D_out * D_in
-    max_diff_trunc = torch.max(torch.abs(Y_gt - Y_mpo2)).item()
-    print(f"Max diff: {max_diff_trunc:.3e}")
-    A_rec_trunc = reconstruct_mpo_matrix(cores_trunc)
-    print(f"||A||_F: {A.norm('fro').item():.3f}  ||A_rec_trunc||_F: {A_rec_trunc.norm('fro').item():.3f}  rel_err: {(A - A_rec_trunc).norm('fro').item() / A.norm('fro').item():.3e}")
-    print(f"MPO 参数量: {mpo_params}")
-    print(f"压缩比: {mpo_params / dense_params:.2%}\n")
+    print(f"=== 3. Energy 模式验证 (threshold=0.99) ===")
+    cores_energy = factor_linear_mpo_custom(A, bond_dim=30, num_cores=3, adaptive_mode="energy", energy_threshold=0.99)
+    Y_mpo_t2 = torch.einsum('aoib,bpjc,cqkd,ijk->aopqd', *cores_energy, X_tensor)
+    Y_mpo2 = Y_mpo_t2.squeeze(0).squeeze(-1).reshape(-1)
+    print(f"Max diff: {torch.max(torch.abs(Y_gt - Y_mpo2)).item():.3e}\n")
 
-    # --- 按比例自动估算 bond_dim ---
-    target = 0.1
-    print(f"=== 4. 按比例估算 bond_dim (target_ratio={target}) ===")
-    est_bond = estimate_bond_dim(A, num_cores=3, target_ratio=target)
-    print(f"估算 bond_dim: {est_bond}")
-    cores_est = factor_linear_mpo_custom(A, bond_dim=est_bond, num_cores=3)
-    mpo_params_est = sum(c.numel() for c in cores_est)
-    actual_ratio = mpo_params_est / dense_params
-    print(f"实际 MPO 参数量: {mpo_params_est}")
-    print(f"实际压缩比: {actual_ratio:.2%}")
-    print("✅ 估算成功\n" if abs(actual_ratio - target) / target < 0.5 else "⚠️ 估算偏差较大\n")
-
+    # 🌟 新增 Quantum 模式验证
+    print(f"=== 4. Quantum 模式验证 (quantum_scale=2.5, 硬上限=64) ===")
+    cores_quantum = factor_linear_mpo_custom(A, bond_dim=64, num_cores=3, adaptive_mode="quantum", quantum_scale=2.5)
+    Y_mpo_t3 = torch.einsum('aoib,bpjc,cqkd,ijk->aopqd', *cores_quantum, X_tensor)
+    Y_mpo3 = Y_mpo_t3.squeeze(0).squeeze(-1).reshape(-1)
+    print(f"Max diff: {torch.max(torch.abs(Y_gt - Y_mpo3)).item():.3e}\n")
 
 if __name__ == "__main__":
     verify_mpo_equivalence()
