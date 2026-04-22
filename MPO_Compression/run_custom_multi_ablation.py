@@ -9,6 +9,7 @@ python run_custom_multi_ablation.py \
 """
 
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
 import sys
 import gc
 import argparse
@@ -38,7 +39,7 @@ class SVDLinear(nn.Module):
         super().__init__()
         target_dtype, target_device = W_orig.dtype, W_orig.device
         with torch.no_grad():
-            U, S, Vh = torch.linalg.svd(W_orig.float().cpu(), full_matrices=False)
+            U, S, Vh = torch.linalg.svd(W_orig.float(), full_matrices=False)
             S_sqrt = torch.diag(torch.sqrt(S[:rank].clamp(min=0)))
             A_weight = S_sqrt @ Vh[:rank, :]
             B_weight = U[:, :rank] @ S_sqrt
@@ -97,8 +98,8 @@ def build_mpo_skeleton(model, layers, ratios, activation_scales_dict):
             s_vec = activation_scales_dict.get(full_name) if activation_scales_dict else None
             
             cores = factor_linear_mpo_custom(
-                lin.weight.cpu().float(), chi_ffn, NUM_CORES, out_fac, in_fac, 
-                s_vec.cpu().float() if s_vec is not None else None, 
+                lin.weight.float(), chi_ffn, NUM_CORES, out_fac, in_fac, 
+                s_vec.float() if s_vec is not None else None, 
                 adaptive=True, energy_threshold=0.99
             )
             cleaned_cores = [c.to(device=lin.weight.device, dtype=lin.weight.dtype) for c in cores]
@@ -111,9 +112,9 @@ def build_mpo_skeleton(model, layers, ratios, activation_scales_dict):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--layers", type=int, nargs='+', required=True)
-    parser.add_argument("--ratios", type=float, nargs='+', required=True)
-    parser.add_argument("--healed_ckpt", type=str, required=True)
+    parser.add_argument("--layers", type=int, nargs='+', default=[14,15,16,17,18])
+    parser.add_argument("--ratios", type=float, nargs='+', default=[0.2,0.2,0.2,0.2,0.2])
+    parser.add_argument("--healed_ckpt", type=str, default="/mnt/sx_data")
     parser.add_argument("--model_name", type=str, default="NousResearch/Llama-2-7b-hf")
     args = parser.parse_args()
 
@@ -165,18 +166,18 @@ def main():
     # 使用辅助函数搭建所有指定层的 MPO 骨架
     model = build_mpo_skeleton(model, args.layers, args.ratios, activation_scales)
     results["3. MPO (No Healing)"] = evaluate_ppl(model, tokenizer)
-    
+    '''
     # ---------------------------------------------------------
     # 4. MPO (Healed, 多层)
     # ---------------------------------------------------------
     print(f"\n[4/4] 评测 MPO+LoRA 缝合后 (加载 Checkpoint)...")
     # 因为上一步 (阶段 3) 已经把骨架搭好了，我们无需从头再搭！
     # 直接把你的 Checkpoint 灌进这个搭好骨架的模型里！
-    ckpt = torch.load(args.healed_ckpt, map_location="cpu")
+    ckpt = torch.load(args.healed_ckpt)
     model.load_state_dict(ckpt, strict=False)
     results["4. MPO (Healed)"] = evaluate_ppl(model, tokenizer)
     del model; torch.cuda.empty_cache(); gc.collect()
-
+    '''
     # ---------------------------------------------------------
     # 打印战报
     # ---------------------------------------------------------

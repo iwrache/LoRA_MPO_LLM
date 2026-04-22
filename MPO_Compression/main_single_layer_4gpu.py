@@ -34,7 +34,7 @@ from calibration import get_activation_scales
 # 🔧 核心配置区
 # ==========================================
 MODEL_NAME = "NousResearch/Llama-2-7b-hf"
-TARGET_LAYER = 16        # 🎯 只对这一层动刀
+TARGET_LAYER = 6        # 🎯 只对这一层动刀
 TARGET_RATIO = 0.2       # 🎯 固定压缩率 (为了看极限，设为 20%)
 LORA_RANK = 32
 NUM_CORES = 3

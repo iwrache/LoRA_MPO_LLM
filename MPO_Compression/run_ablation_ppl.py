@@ -25,6 +25,7 @@ sys.path.insert(0, str(parent_dir))
 import test_MPO
 
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import gc
 import torch
 import torch.nn as nn
@@ -49,7 +50,7 @@ class SVDLinear(nn.Module):
         target_dtype = W_orig.dtype
         target_device = W_orig.device
         with torch.no_grad():
-            U, S, Vh = torch.linalg.svd(W_orig.float().cpu(), full_matrices=False)
+            U, S, Vh = torch.linalg.svd(W_orig.float(), full_matrices=False)
             S_sqrt = torch.diag(torch.sqrt(S[:rank].clamp(min=0)))
             A_weight = S_sqrt @ Vh[:rank, :]
             B_weight = U[:, :rank] @ S_sqrt
@@ -99,8 +100,8 @@ def evaluate_ppl(model, tokenizer, max_seq_len=2048, stride=512):
 # ==========================================
 def main():
     MODEL_NAME = "NousResearch/Llama-2-7b-hf"
-    HEALED_CKPT = "./ablation_layer16_only_r0.2.pt" # 你刚才保存的单层模型
-    TARGET_LAYER = 16
+    HEALED_CKPT = "/mnt/sx_data/ablation_layer16_only_r0.2.pt" # 你刚才保存的单层模型
+    TARGET_LAYER = 3
     TARGET_RATIO = 0.2
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -145,8 +146,8 @@ def main():
         s_vec = activation_scales.get(f"model.layers.{TARGET_LAYER}.mlp.{proj}")
         
         cores = factor_linear_mpo_custom(
-            lin.weight.cpu().float(), chi_ffn, 3, out_fac, in_fac, 
-            s_vec.cpu().float() if s_vec is not None else None, 
+            lin.weight.float(), chi_ffn, 3, out_fac, in_fac, 
+            s_vec.float() if s_vec is not None else None, 
             adaptive=True, energy_threshold=0.99
         )
         cleaned_cores = [c.to(device=lin.weight.device, dtype=lin.weight.dtype) for c in cores]
@@ -154,6 +155,7 @@ def main():
         setattr(blk.mlp, proj, ResMPOWrapper(mpo, in_f, out_f, 32, lin.weight))
     results["3. MPO (No Healing)"] = evaluate_ppl(model, tokenizer)
     
+    '''
     # 4. MPO (Healed, 仅 Layer 16)
     print("\n[4/4] 评测 MPO+LoRA 微调后的状态 (Healed)...")
     # 因为我们上一步已经搭好骨架了，直接把 pt 权重灌进去即可！
@@ -161,7 +163,7 @@ def main():
     model.load_state_dict(ckpt, strict=False)
     results["4. MPO (Healed)"] = evaluate_ppl(model, tokenizer)
     del model; torch.cuda.empty_cache(); gc.collect()
-
+    '''
     # 输出战报
     print("\n" + "="*60)
     print(f" 🚀 单层 (Layer {TARGET_LAYER}) 极限消融战报 (压缩率: {TARGET_RATIO*100}%)")
@@ -171,4 +173,8 @@ def main():
     print("="*60)
 
 if __name__ == "__main__":
+    import time
+    start_time = time.time()
     main()
+    end_time = time.time()
+    print("cost time:", end_time-start_time)
