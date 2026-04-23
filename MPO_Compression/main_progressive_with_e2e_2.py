@@ -5,6 +5,8 @@ MPO 究极压缩管线 (Block-Wise Joint Optimization V8.0)
 """
 
 import os
+os.environ["HF_HOME"] = "/mnt/hf-cache"
+os.environ["HF_DATASETS_CACHE"] = "/mnt/hf-cache/datasets"
 # 强制锁定前3张卡
 #if "CUDA_VISIBLE_DEVICES" not in os.environ:
 #    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
@@ -81,7 +83,7 @@ class ResMPOWrapper(nn.Module):
             bias_backup = mpo_gpu.bias.data.clone() if hasattr(mpo_gpu, 'bias') and mpo_gpu.bias is not None else None
             if bias_backup is not None: mpo_gpu.bias.data.zero_()
 
-            eye = torch.eye(in_features, device=target_device, dtype=torch.float32)  
+            eye = torch.eye(in_features, device=target_device, dtype=target_dtype)  
             W_mpo = mpo_gpu(eye).T                             
             if bias_backup is not None: mpo_gpu.bias.data.copy_(bias_backup)
 
@@ -182,9 +184,10 @@ def main():
     # 🌟 修复：补齐量子自组织的核心参数！
     parser.add_argument("--adaptive_mode", type=str, default="quantum", 
                         choices=["fixed", "energy", "entropy", "quantum"])
-    parser.add_argument("--quantum_scale", type=float, default=1, 
+    parser.add_argument("--quantum_scale", type=float, default=0.6, 
                         help="量子自组织常数 α (越大保留越多，推荐 1.5 ~ 3.5)")
-    
+    parser.add_argument("--disable_asvd", action="store_true", help="[消融实验] 关闭激活值缩放")
+    parser.add_argument("--disable_perm", action="store_true", help="[消融实验] 关闭通道聚类重排")
     args = parser.parse_args()
 
     custom_ratio_map = dict(zip(args.custom_layers, args.custom_ratios))
@@ -258,262 +261,382 @@ def main():
     calib_inputs = [tokenizer(t, return_tensors="pt", max_length=256, truncation=True).input_ids for t in calib_texts]
     print(f"✅ 成功构建 {len(calib_inputs)} 条混合黄金特征数据 (Wiki+Chat)！")
 
-    print(f"\n🦴 [阶段 1] 动态搭建全网络 MPO 骨架 (ASVD 激活感知识别中)...")
-    activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=32, max_len=256)
-    
-    # ====== 替换阶段 1 的 for layer_idx 循环体 ======
 
-    for layer_idx in range(num_layers):
-        ratio = custom_ratio_map.get(layer_idx, get_u_shape_ratio(layer_idx, num_layers, args.target_ratio))
-        if ratio >= 0.99:
-            continue
 
-        student_layer = student_model.model.layers[layer_idx]
-        NUM_CORES, LORA_RANK = 3, 32
-
-        gate_lin = student_layer.mlp.gate_proj
-        up_lin   = student_layer.mlp.up_proj
-        down_lin = student_layer.mlp.down_proj
-
-        # ============================================================
-        # Step 1: 找最优排列 P（联合聚类 gate + up 的行）
-        # ============================================================
-        print(f"  🔀 Layer {layer_idx}: 计算最优行排列...")
-        
-        # 🚀 修正 1：去掉 .cpu()，让大矩阵留在 GPU，准备满速计算！
-        W_gate_raw = gate_lin.weight.detach().float()
-        W_up_raw   = up_lin.weight.detach().float()
-
-        s_vec_gate = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.gate_proj")
-        s_vec_up   = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.up_proj")
-        
-        # 🚀 修正 2：确保缩放系数也老老实实待在 GPU 上！
-        s_val_gate = s_vec_gate.to(W_gate_raw.device).float() if isinstance(s_vec_gate, torch.Tensor) else (s_vec_gate or 1.0)
-        s_val_up   = s_vec_up.to(W_up_raw.device).float() if isinstance(s_vec_up, torch.Tensor) else (s_vec_up or 1.0)
-
-        W_gate_scaled = W_gate_raw * s_val_gate
-        W_up_scaled   = W_up_raw * s_val_up
-
-        # 聚类函数内部已经写了 .cpu().numpy()，传 GPU 张量进去完全合法且安全
-        perm_cpu = find_permutation_for_ffn(W_gate_scaled, W_up_scaled)
-        
-        # 🚀 护盾 1：把索引张量送到与权重同一张显卡上，实现无缝切片！
-        perm = perm_cpu.to(W_gate_raw.device)
-
-        # 🚀 修正 3：在 GPU 上重排后，立刻加上 .contiguous() 锁死显存连续性，防止 cuSOLVER 越界！
-        W_gate_perm = W_gate_raw[perm, :].contiguous()
-        W_up_perm   = W_up_raw[perm, :].contiguous()
-        W_down_perm = down_lin.weight.detach().float()[:, perm].contiguous()
-        with torch.no_grad():
-            down_lin.weight.copy_(W_down_perm.to(dtype=down_lin.weight.dtype))
-
-        # 加入 is_down 标志位，统一处理三大矩阵
-        for proj, W_perm, is_down in [
-            ("gate_proj", W_gate_perm, False), 
-            ("up_proj", W_up_perm, False), 
-            ("down_proj", W_down_perm, True)
-        ]:
-            lin = getattr(student_layer.mlp, proj)
-            out_f, in_f = lin.weight.shape
-            chi_ffn = estimate_mpo_bond_dim(in_f, out_f, NUM_CORES, ratio)
-            out_fac = find_factors_balanced(out_f, NUM_CORES)
-            in_fac  = find_factors_balanced(in_f, NUM_CORES)
-
-            s_vec = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.{proj}")
-            s_gpu = None
-            if s_vec is not None:
-                s_gpu = s_vec.to(lin.weight.device).float().contiguous() if isinstance(s_vec, torch.Tensor) else float(s_vec)
-                # 🚀 核心修复：down_proj 的输入列已经被打乱，激活因子必须同步打乱！
-                if is_down and isinstance(s_gpu, torch.Tensor):
-                    s_gpu = s_gpu[perm].contiguous()
-
-            W_cpu_for_mpo = W_perm.detach().cpu().float()
-            s_cpu_for_mpo = s_gpu.detach().cpu().float() if isinstance(s_gpu, torch.Tensor) else s_gpu
-
-            # 🌟 新代码：传入量子参数，并给 bond_dim 设置一个防爆显存的硬上限（比如 256）
-            cores = factor_linear_mpo_custom(
-                W_cpu_for_mpo, 
-                bond_dim=256,         
-                num_cores=NUM_CORES, 
-                out_fac=out_fac, 
-                in_fac=in_fac,
-                s_vector=s_cpu_for_mpo, 
-                adaptive_mode=args.adaptive_mode,  
-                quantum_scale=args.quantum_scale   
-            )
-
-            # 🌟 修复：真实参数量 = MPO Cores 参数 + LoRA 参数
-            orig_params = W_perm.numel()
-            actual_mpo_params = sum(c.numel() for c in cores)
-            actual_lora_params = in_f * LORA_RANK + out_f * LORA_RANK
-            actual_total_params = actual_mpo_params + actual_lora_params
-            actual_ratio = actual_total_params / orig_params
-            
-            print(f"      ↳ [{proj}] 量子自组织压缩率: {actual_ratio*100:.2f}% (MPO: {actual_mpo_params}, LoRA: {actual_lora_params})")
-
-            cleaned_cores = [c.to(device=lin.weight.device, dtype=lin.weight.dtype) for c in cores]
-            W_orig_for_res = W_perm.to(dtype=lin.weight.dtype)
-
-            mpo = MPOLinear(in_f, out_f, cleaned_cores, s_vector=s_gpu)
-            setattr(
-                student_layer.mlp, proj,
-                ResMPOWrapper(mpo, in_f, out_f, LORA_RANK, W_orig_for_res, skip_svd=False, s_vector=s_gpu)
-            )
-
-        print(f"  ✅ Layer {layer_idx}: Permutation + MPO + LoRA 骨架搭建完毕")
-
-    # ====================================================================
-    # 🌟 终极追踪：阶段 1 结束后，直接透视整个模型的最终物理体积！
-    # ====================================================================
-    orig_total_params = sum(p.numel() for p in teacher_model.parameters())
-    new_total_params = sum(p.numel() for p in student_model.parameters())
-    
-    print("\n" + "="*70)
-    print(" 📊 [阶段 1 总结] 量子自组织压缩战报")
-    print(f" 原始模型总参数量 : {orig_total_params / 1e9:.4f} B (Billion)")
-    print(f" 压缩后模型总参数量: {new_total_params / 1e9:.4f} B (Billion)")
-    print(f" 🌟 全模型真实保留率: {(new_total_params / orig_total_params) * 100:.2f}%")
-    print(f" (注：由于保护了首尾层和 Embedding，所以全模型保留率会比单层 MLPs 的保留率稍高，这是正常的！)")
-    print("="*70)
-
+    # 🌟 定义你的存档路径
     PROGRESS_CKPT = "/mnt/sx_data/progressive_layer_checkpoint.pt"
     
-    # ---------------------------------------------------------
-    # 🌌 [阶段 2] 逐层误差吸收 (Sequential Cascading) + Block-wise 联合优化
-    # ---------------------------------------------------------
-    print(f"\n[阶段 2] 🧬 启动 Block-wise 级联特征对齐 (Cross-layer Error Compensation)...")
+    # 🌟 增加跳过标志
+    skip_to_phase_4 = False
     
-    for layer_idx in range(num_layers):
-        ratio = custom_ratio_map.get(layer_idx, get_u_shape_ratio(layer_idx, num_layers, args.target_ratio))
-        if ratio >= 0.99:
-            print(f"\n ⏭️ Layer {layer_idx} [首尾保护区]，跳过。")
-            continue
-
-        student_layer = student_model.model.layers[layer_idx]
-        teacher_layer = teacher_model.model.layers[layer_idx]
-        layer_device = next(student_layer.parameters()).device
-        
-        print(f"\n 🎯 正在级联对齐 Layer {layer_idx} (联合优化 gate & up)...")
-        
-        # ========================================================
-        # 🚨 Step 4: Sequential Calibration 数据截获 (加入极速短路截断)
-        # ========================================================
-        class StopForwardException(Exception): pass
-
-        cached_mlp_inputs = []
-        def capture_hook(module, args):
-            # 🚨 极速展平修复：不管原来是 [1, 192, H] 还是 [1, 126, H]
-            # 直接重塑为 [192, H] 或 [126, H] 的二维矩阵，这样 torch.cat 拼接时就畅通无阻了！
-            flattened_X = args[0].detach().cpu().reshape(-1, args[0].shape[-1])
-            cached_mlp_inputs.append(flattened_X)
-            
-            # 拿到当前层的输入后，立刻抛出异常打断前向传播，绝不跑后面的层！
-            raise StopForwardException
-            
-        handle = student_layer.mlp.register_forward_pre_hook(capture_hook)
-        
-        # 获取最安全的底层设备，防止多卡 device_map 报错
-        embed_device = student_model.model.embed_tokens.weight.device
-        
-        with torch.no_grad():
-            for input_ids in tqdm(calib_inputs, desc=f"积累前序层误差 (极速截断中)", leave=False):
-                try:
-                    student_model(input_ids.to(embed_device))
-                except StopForwardException:
-                    pass  # 正常捕获我们自己抛出的异常，继续处理下一条数据
-        handle.remove()
-        
-        # 将积累的特征拼接
-        X_calib_tensor = torch.cat(cached_mlp_inputs, dim=0) # [Num_samples * Seq_len, Hidden_Dim]
-
-        # ========================================================
-        # 🚨 Step 3 & 5: Block-wise 激活空间联合优化
-        # ========================================================
-        for param in student_model.parameters(): param.requires_grad = False
-        
-        trainable_params_for_opt = []
-        raw_params_for_clip = []
-        
-        # 将 gate 和 up 的所有参数放入统一个优化池，强迫它们互相补偿！
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
-            wrapper = getattr(student_layer.mlp, proj)
-            wrapper.lora_A.requires_grad = True
-            wrapper.lora_B.requires_grad = True
-            for core in wrapper.mpo.cores: core.requires_grad = True
-            
-            trainable_params_for_opt.extend([
-                {"params": wrapper.lora_A, "lr": 1e-4}, 
-                {"params": wrapper.lora_B, "lr": 1e-4}, 
-                {"params": wrapper.mpo.cores, "lr": 1e-5}
-            ])
-            raw_params_for_clip.extend([wrapper.lora_A, wrapper.lora_B] + list(wrapper.mpo.cores))
-            
-        optimizer = torch.optim.AdamW(trainable_params_for_opt, weight_decay=0.01)
-        student_layer.mlp.train()
-        
-        # 获取 Teacher 当前层所在的具体物理显卡
-        teacher_device = next(teacher_layer.parameters()).device
-
-        # ========================================================
-        # 取一个小 batch 用于联合寻优
-        # 🚨 直接把二维张量赋给 X_flat，行数就是真实的 token 数量
-        X_flat = X_calib_tensor
-        num_tokens = X_flat.shape[0]
-        # ========================================================
-        
-        for step in range(args.local_steps):
-            optimizer.zero_grad()
-            
-            sample_indices = torch.randperm(num_tokens)[:2048]
-            # X_batch 在 Student 的显卡上
-            X_batch = X_flat[sample_indices].to(device=layer_device, dtype=torch.float32)
-            
-            # 🚀 护盾 2：把数据送到 Teacher 的显卡上计算，算完再拉回 Student 的显卡计算 Loss！
-            with torch.no_grad():
-                Y_orig = teacher_layer.mlp(X_batch.to(teacher_device)).to(layer_device)
-                
-            # 计算 Student 的实际输出 (此时 X_batch 和 Student 同在一个 GPU，非常安全)
-            Y_recon = student_layer.mlp(X_batch)
-            
-            loss = F.mse_loss(Y_recon, Y_orig)
-            loss.backward()
-            
-            has_nan_grad = any(p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()) for p in raw_params_for_clip)
-            if has_nan_grad: 
-                optimizer.zero_grad()
-                continue
-                
-            torch.nn.utils.clip_grad_norm_(raw_params_for_clip, 1.0)
-            optimizer.step()
-            
-        print(f"    ✅ Block-wise 联合收敛! MLP Output MSE: {loss.item():.6f}")
-        
-        # 优化完毕，重新冻结
-        student_layer.mlp.eval()
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
-            wrapper = getattr(student_layer.mlp, proj)
-            wrapper.lora_A.requires_grad = False
-            wrapper.lora_B.requires_grad = False
-            for core in wrapper.mpo.cores: core.requires_grad = False
-
-        # 释放显存护盾
-        del optimizer
-        del cached_mlp_inputs, X_calib_tensor, X_flat
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        tmp_ckpt = PROGRESS_CKPT + ".tmp"
-        # 🌟 3. 防撞车结界：只允许主卡 (GPU 0) 去写硬盘！
+    # 1. 检查是否存在完整存档
+    if os.path.exists(PROGRESS_CKPT):
         if accelerator.is_main_process:
-            try:
-                torch.save({'next_layer': layer_idx + 1, 'model_state_dict': student_model.state_dict()}, tmp_ckpt)
-                os.replace(tmp_ckpt, PROGRESS_CKPT)
-            except Exception as e:
-                print(f"    ⚠️ 保存异常: {e}")
-    
-    print("\n[阶段 3] 测量 Block-wise 级联特征对齐后的 PPL...")
-    ppl_mid = eval_ppl(student_model, tokenizer)
-    print(f"🌟 【阶段二】级联收敛 PPL: {ppl_mid}")
+            print(f"\n📦 检测到阶段 2 的完美存档：{PROGRESS_CKPT}")
+            print("🚀 直接跳过前三个阶段，启动『伪骨架搭建』与『权重注入』...")
+        # 强制设为 True，跳过 1-3 阶段
+        skip_to_phase_4 = True 
+
+    # =============================================================
+    # ⚡ 核心逻辑分流
+    # =============================================================
+    if skip_to_phase_4:
+        if accelerator.is_main_process:
+            print("🦴 正在基于真实存档，精准重塑动态 MPO + LoRA 拓扑流形...")
+            
+        # 1. 加载存档字典
+        ckpt = torch.load(PROGRESS_CKPT, map_location="cpu")
+        state_dict = ckpt['model_state_dict']
+        
+        # 2. 严密复刻骨架
+        for layer_idx in range(student_model.config.num_hidden_layers):
+            student_layer = student_model.model.layers[layer_idx]
+            
+            for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                lin = getattr(student_layer.mlp, proj_name)
+                in_f, out_f = lin.weight.shape[1], lin.weight.shape[0]
+                
+                # 获取该层参数的前缀
+                prefix = f"model.layers.{layer_idx}.mlp.{proj_name}.mpo.cores."
+                core_keys = [k for k in state_dict.keys() if k.startswith(prefix)]
+                NUM_CORES = len(core_keys)
+                
+                if NUM_CORES == 0:
+                    continue # 防御性逻辑：如果这一层没有被压缩，跳过
+                
+                # 🌟 核心修改：与其手动捏造，不如直接提取真实的 cores 作为初始化参数！
+                # 这样 MPO 类在实例化时，就会用真实的 shape 去推导出完美的 self.bonds！
+                real_cores = []
+                for i in range(NUM_CORES):
+                    real_cores.append(torch.nn.Parameter(state_dict[f"{prefix}{i}"].clone().to(device=lin.weight.device)))
+                
+                # 用真实的物理结构实例化 MPO
+                mpo = MPOLinear(in_f, out_f, real_cores)
+                
+                # 动态获取 LoRA Rank
+                lora_prefix = f"model.layers.{layer_idx}.mlp.{proj_name}.lora_A"
+                LORA_RANK = state_dict[lora_prefix].shape[0] if lora_prefix in state_dict else 32
+                
+                # 注入 Wrapper 
+                # 【极其关键】：这里传入 skip_svd=True！因为我们马上就会被 load_state_dict 覆盖，
+                # 所以绝对不要让 ResMPOWrapper 在内部又去算一遍漫长且覆盖原有状态的 SVD！
+                setattr(student_layer.mlp, proj_name, ResMPOWrapper(mpo, in_f, out_f, LORA_RANK, lin.weight, skip_svd=True))
+                
+        if accelerator.is_main_process:
+            print("💉 物理骨架重塑完毕！正在执行联合权重覆写...")
+            
+        # 3. 完美覆盖所有细节（包括 LoRA 的残差）
+        student_model.load_state_dict(state_dict, strict=False)
+        
+        # 4. 暴力释放内存
+        del ckpt, state_dict
+        import gc; gc.collect()
+        torch.cuda.empty_cache()
+        
+        if accelerator.is_main_process:
+            print("✅ 完美复原！准备点火 E2E Healing！")
+
+    else:        
+        print(f"\n🦴 [阶段 1] 动态搭建全网络 MPO 骨架...")
+        
+        if args.disable_asvd:
+            print("   ⚠️ [消融实验] 已激活 --disable_asvd，将使用【纯权重 MPO/SVD】！")
+            # 直接给一个空字典，后续所有的 .get() 都会返回 None
+            activation_scales_dict = {} 
+        else:
+            print("   🔍 正在提取 ASVD 激活缩放因子 (Activation Scales)...")
+            activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=32, max_len=256)
+        
+        # ====== 替换阶段 1 的 for layer_idx 循环体 ======
+
+        for layer_idx in range(num_layers):
+            ratio = custom_ratio_map.get(layer_idx, get_u_shape_ratio(layer_idx, num_layers, args.target_ratio))
+            if ratio >= 0.99:
+                continue
+
+            student_layer = student_model.model.layers[layer_idx]
+            NUM_CORES, LORA_RANK = 3, 32
+
+            gate_lin = student_layer.mlp.gate_proj
+            up_lin   = student_layer.mlp.up_proj
+            down_lin = student_layer.mlp.down_proj
+
+            # ============================================================
+            # Step 1: 找最优排列 P（联合聚类 gate + up 的行）
+            # ============================================================
+            print(f"  🔀 Layer {layer_idx}: 计算最优行排列...")
+            
+            # 🚀 修正 1：去掉 .cpu()，让大矩阵留在 GPU，准备满速计算！
+            W_gate_raw = gate_lin.weight.detach().float()
+            W_up_raw   = up_lin.weight.detach().float()
+
+            s_vec_gate = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.gate_proj")
+            s_vec_up   = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.up_proj")
+            
+            # 🚀 修正 2：确保缩放系数也老老实实待在 GPU 上！
+            s_val_gate = s_vec_gate.to(W_gate_raw.device).float() if isinstance(s_vec_gate, torch.Tensor) else (s_vec_gate or 1.0)
+            s_val_up   = s_vec_up.to(W_up_raw.device).float() if isinstance(s_vec_up, torch.Tensor) else (s_vec_up or 1.0)
+
+            W_gate_scaled = W_gate_raw * s_val_gate
+            W_up_scaled   = W_up_raw * s_val_up
+
+            # ==========================================
+            # 🌟 消融实验开关 2：是否开启通道重排 (Permutation)
+            # ==========================================
+            if getattr(args, 'disable_perm', False):
+                print("   ⚠️ [消融实验] 已激活 --disable_perm，关闭通道重排，使用原始物理拓扑！")
+                
+                # 禁用重排时，直接沿用原始权重，不改变内存布局
+                W_gate_perm = W_gate_raw.contiguous()
+                W_up_perm   = W_up_raw.contiguous()
+                
+                # 🚨 极其关键：关闭重排时，绝对不要去修改 down_lin.weight！
+                
+            else:
+                print("   🔄 正在执行 FFN 通道聚类重排 (Permutation)...")
+                
+                # 聚类函数内部已经写了 .cpu().numpy()，传 GPU 张量进去完全合法且安全
+                perm_cpu = find_permutation_for_ffn(W_gate_scaled, W_up_scaled)
+                
+                # 🚀 护盾 1：把索引张量送到与权重同一张显卡上，实现无缝切片！
+                perm = perm_cpu.to(W_gate_raw.device)
+
+                # 🚀 修正 3：在 GPU 上重排后，立刻加上 .contiguous() 锁死显存连续性，防止 cuSOLVER 越界！
+                W_gate_perm = W_gate_raw[perm, :].contiguous()
+                W_up_perm   = W_up_raw[perm, :].contiguous()
+                
+                # 联动修改 down_proj 的列通道
+                W_down_perm = down_lin.weight.detach().float()[:, perm].contiguous()
+                with torch.no_grad():
+                    down_lin.weight.copy_(W_down_perm.to(dtype=down_lin.weight.dtype))
+
+            # 加入 is_down 标志位，统一处理三大矩阵
+            for proj, W_perm, is_down in [
+                ("gate_proj", W_gate_perm, False), 
+                ("up_proj", W_up_perm, False), 
+                ("down_proj", W_down_perm, True)
+            ]:
+                lin = getattr(student_layer.mlp, proj)
+                out_f, in_f = lin.weight.shape
+                chi_ffn = estimate_mpo_bond_dim(in_f, out_f, NUM_CORES, ratio)
+                out_fac = find_factors_balanced(out_f, NUM_CORES)
+                in_fac  = find_factors_balanced(in_f, NUM_CORES)
+
+                s_vec = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.{proj}")
+                s_gpu = None
+                if s_vec is not None:
+                    s_gpu = s_vec.to(lin.weight.device).float().contiguous() if isinstance(s_vec, torch.Tensor) else float(s_vec)
+                    # 🚀 核心修复：down_proj 的输入列已经被打乱，激活因子必须同步打乱！
+                    if is_down and isinstance(s_gpu, torch.Tensor):
+                        s_gpu = s_gpu[perm].contiguous()
+
+                W_cpu_for_mpo = W_perm.detach().cpu().float()
+                s_cpu_for_mpo = s_gpu.detach().cpu().float() if isinstance(s_gpu, torch.Tensor) else s_gpu
+
+                # 🌟 新代码：传入量子参数，并给 bond_dim 设置一个防爆显存的硬上限（比如 256）
+                cores = factor_linear_mpo_custom(
+                    W_cpu_for_mpo, 
+                    bond_dim=256,         
+                    num_cores=NUM_CORES, 
+                    out_fac=out_fac, 
+                    in_fac=in_fac,
+                    s_vector=s_cpu_for_mpo, 
+                    adaptive_mode=args.adaptive_mode,  
+                    quantum_scale=args.quantum_scale   
+                )
+
+                # 🌟 修复：真实参数量 = MPO Cores 参数 + LoRA 参数
+                orig_params = W_perm.numel()
+                actual_mpo_params = sum(c.numel() for c in cores)
+                actual_lora_params = in_f * LORA_RANK + out_f * LORA_RANK
+                actual_total_params = actual_mpo_params + actual_lora_params
+                actual_ratio = actual_total_params / orig_params
+                
+                # 🌟 使用 accelerator.process_index 获取当前是 GPU 几
+                gpu_id = accelerator.process_index
+                print(f"      ↳ [GPU {gpu_id}] [{proj}] 量子自组织压缩率: {actual_ratio*100:.2f}% (MPO: {actual_mpo_params}, LoRA: {actual_lora_params})")
+
+                cleaned_cores = [c.to(device=lin.weight.device, dtype=lin.weight.dtype) for c in cores]
+                W_orig_for_res = W_perm.to(dtype=lin.weight.dtype)
+
+                mpo = MPOLinear(in_f, out_f, cleaned_cores, s_vector=s_gpu)
+                setattr(
+                    student_layer.mlp, proj,
+                    ResMPOWrapper(mpo, in_f, out_f, LORA_RANK, W_orig_for_res, skip_svd=False, s_vector=s_gpu)
+                )
+
+            print(f"  ✅ Layer {layer_idx}: Permutation + MPO + LoRA 骨架搭建完毕")
+
+        # ====================================================================
+        # 🌟 终极追踪：阶段 1 结束后，直接透视整个模型的最终物理体积！
+        # ====================================================================
+        orig_total_params = sum(p.numel() for p in teacher_model.parameters())
+        new_total_params = sum(p.numel() for p in student_model.parameters())
+        
+        print("\n" + "="*70)
+        print(" 📊 [阶段 1 总结] 量子自组织压缩战报")
+        print(f" 原始模型总参数量 : {orig_total_params / 1e9:.4f} B (Billion)")
+        print(f" 压缩后模型总参数量: {new_total_params / 1e9:.4f} B (Billion)")
+        print(f" 🌟 全模型真实保留率: {(new_total_params / orig_total_params) * 100:.2f}%")
+        print(f" (注：由于保护了首尾层和 Embedding，所以全模型保留率会比单层 MLPs 的保留率稍高，这是正常的！)")
+        print("="*70)
+
+        PROGRESS_CKPT = "/mnt/sx_data/progressive_layer_checkpoint.pt"
+        
+        # ---------------------------------------------------------
+        # 🌌 [阶段 2] 逐层误差吸收 (Sequential Cascading) + Block-wise 联合优化
+        # ---------------------------------------------------------
+        print(f"\n[阶段 2] 🧬 启动 Block-wise 级联特征对齐 (Cross-layer Error Compensation)...")
+        
+        for layer_idx in range(num_layers):
+            ratio = custom_ratio_map.get(layer_idx, get_u_shape_ratio(layer_idx, num_layers, args.target_ratio))
+            if ratio >= 0.99:
+                print(f"\n ⏭️ Layer {layer_idx} [首尾保护区]，跳过。")
+                continue
+
+            student_layer = student_model.model.layers[layer_idx]
+            teacher_layer = teacher_model.model.layers[layer_idx]
+            layer_device = next(student_layer.parameters()).device
+            
+            print(f"\n 🎯 正在级联对齐 Layer {layer_idx} (联合优化 gate & up)...")
+            
+            # ========================================================
+            # 🚨 Step 4: Sequential Calibration 数据截获 (加入极速短路截断)
+            # ========================================================
+            class StopForwardException(Exception): pass
+
+            cached_mlp_inputs = []
+            def capture_hook(module, args):
+                # 🚨 极速展平修复：不管原来是 [1, 192, H] 还是 [1, 126, H]
+                # 直接重塑为 [192, H] 或 [126, H] 的二维矩阵，这样 torch.cat 拼接时就畅通无阻了！
+                flattened_X = args[0].detach().cpu().reshape(-1, args[0].shape[-1])
+                cached_mlp_inputs.append(flattened_X)
+                
+                # 拿到当前层的输入后，立刻抛出异常打断前向传播，绝不跑后面的层！
+                raise StopForwardException
+                
+            handle = student_layer.mlp.register_forward_pre_hook(capture_hook)
+            
+            # 获取最安全的底层设备，防止多卡 device_map 报错
+            embed_device = student_model.model.embed_tokens.weight.device
+            
+            with torch.no_grad():
+                for input_ids in tqdm(calib_inputs, desc=f"积累前序层误差 (极速截断中)", leave=False):
+                    try:
+                        student_model(input_ids.to(embed_device))
+                    except StopForwardException:
+                        pass  # 正常捕获我们自己抛出的异常，继续处理下一条数据
+            handle.remove()
+            
+            # 将积累的特征拼接
+            X_calib_tensor = torch.cat(cached_mlp_inputs, dim=0) # [Num_samples * Seq_len, Hidden_Dim]
+
+            # ========================================================
+            # 🚨 Step 3 & 5: Block-wise 激活空间联合优化
+            # ========================================================
+            for param in student_model.parameters(): param.requires_grad = False
+            
+            trainable_params_for_opt = []
+            raw_params_for_clip = []
+            
+            # 将 gate 和 up 的所有参数放入统一个优化池，强迫它们互相补偿！
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                wrapper = getattr(student_layer.mlp, proj)
+                wrapper.lora_A.requires_grad = True
+                wrapper.lora_B.requires_grad = True
+                for core in wrapper.mpo.cores: core.requires_grad = True
+                
+                trainable_params_for_opt.extend([
+                    {"params": wrapper.lora_A, "lr": 1e-4}, 
+                    {"params": wrapper.lora_B, "lr": 1e-4}, 
+                    {"params": wrapper.mpo.cores, "lr": 1e-5}
+                ])
+                raw_params_for_clip.extend([wrapper.lora_A, wrapper.lora_B] + list(wrapper.mpo.cores))
+                
+            optimizer = torch.optim.AdamW(trainable_params_for_opt, weight_decay=0.01)
+            student_layer.mlp.train()
+            
+            # 获取 Teacher 当前层所在的具体物理显卡
+            teacher_device = next(teacher_layer.parameters()).device
+
+            # ========================================================
+            # 取一个小 batch 用于联合寻优
+            # 🚨 直接把二维张量赋给 X_flat，行数就是真实的 token 数量
+            X_flat = X_calib_tensor
+            num_tokens = X_flat.shape[0]
+            # ========================================================
+            
+            for step in range(args.local_steps):
+                optimizer.zero_grad()
+                
+                sample_indices = torch.randperm(num_tokens)[:2048]
+                # X_batch 在 Student 的显卡上
+                # 🌟 核心修复：让输入数据的精度自动对齐 Teacher/Student 权重的精度 (BFloat16)
+                current_dtype = next(student_layer.parameters()).dtype
+                X_batch = X_flat[sample_indices].to(device=layer_device, dtype=current_dtype)
+                
+                # 🚀 护盾 2：把数据送到 Teacher 的显卡上计算，算完再拉回 Student 的显卡计算 Loss！
+                with torch.no_grad():
+                    Y_orig = teacher_layer.mlp(X_batch.to(teacher_device)).to(layer_device)
+                    
+                # 计算 Student 的实际输出 (此时 X_batch 和 Student 同在一个 GPU，非常安全)
+                Y_recon = student_layer.mlp(X_batch)
+                
+                loss = F.mse_loss(Y_recon, Y_orig)
+                loss.backward()
+                
+                has_nan_grad = any(p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()) for p in raw_params_for_clip)
+                if has_nan_grad: 
+                    optimizer.zero_grad()
+                    continue
+                    
+                torch.nn.utils.clip_grad_norm_(raw_params_for_clip, 1.0)
+                optimizer.step()
+                
+            print(f"    ✅ Block-wise 联合收敛! MLP Output MSE: {loss.item():.6f}")
+            
+            # 优化完毕，重新冻结
+            student_layer.mlp.eval()
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                wrapper = getattr(student_layer.mlp, proj)
+                wrapper.lora_A.requires_grad = False
+                wrapper.lora_B.requires_grad = False
+                for core in wrapper.mpo.cores: core.requires_grad = False
+
+            # 释放显存护盾
+            del optimizer
+            del cached_mlp_inputs, X_calib_tensor, X_flat
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # 🌟 终极防撞车与死锁结界
+            # 先让所有显卡在这里停下来等一等，确保大家都算完了
+            accelerator.wait_for_everyone() 
+
+            if accelerator.is_main_process:
+                try:
+                    tmp_ckpt = PROGRESS_CKPT + f".tmp_{layer_idx}"
+                    print(f"    💾 正在主卡提取权重...")
+                    # 使用 unwrap_model 脱去多卡外衣，保证权重干净
+                    state_dict = accelerator.unwrap_model(student_model).state_dict()
+                    
+                    print(f"    💾 正在写入临时文件...")
+                    torch.save({'next_layer': layer_idx + 1, 'model_state_dict': state_dict}, tmp_ckpt)
+                    
+                    print(f"    💾 正在替换正式文件...")
+                    os.replace(tmp_ckpt, PROGRESS_CKPT)
+                    print(f"    ✅ Layer {layer_idx} 级联存档成功落盘！")
+                except Exception as e:
+                    print(f"    🚨 致命警告：保存异常！{e}")
+            
+            # 再次让所有显卡在这里同步，只有主卡完全写完了硬盘，另外两张卡才能进入下一层
+            accelerator.wait_for_everyone()
+        
+        print("\n[阶段 3] 测量 Block-wise 级联特征对齐后的 PPL...")
+        ppl_mid = eval_ppl(student_model, tokenizer)
+        print(f"🌟 【阶段二】级联收敛 PPL: {ppl_mid}")
+
+    accelerator.wait_for_everyone()
 
     print("\n[阶段 4] 🌌 启动端到端联合蒸馏 (E2E Healing)...")
     os.environ["MPO_EVAL_PATH"] = "mpo"; os.environ["MPO_TRAIN_PATH"] = "mpo"

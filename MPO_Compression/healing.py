@@ -1,5 +1,15 @@
 # healing.py
 import os
+
+# 🚨 必须在 import 之前设置环境变量
+os.environ["HF_HOME"] = "/mnt/hf-cache"
+os.environ["HF_DATASETS_CACHE"] = "/mnt/hf-cache/datasets"
+
+from datasets import load_dataset, concatenate_datasets
+
+# 增加 cache_dir 双保险
+CACHE_DIR = "/mnt/hf-cache/datasets"
+os.makedirs(CACHE_DIR, exist_ok=True)
 import time
 import torch
 import torch.nn as nn
@@ -7,7 +17,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 import bitsandbytes as bnb
-from datasets import load_dataset, concatenate_datasets
 import random
 from accelerate import Accelerator
 
@@ -208,10 +217,19 @@ def chat_collate_fn(batch, pad_token_id):
 def get_mixed_healing_dataset(seed=42):
     print("🧪 正在调配大模型终极康复药剂 (5万条 PT+SFT 混合数据集)...")
 
-    # 1. 骨骼重塑：RedPajama 纯预训练数据 (50% - 25,000条)
-    print("   -> 抽取 25,000 条预训练生肉数据 (RedPajama)...")
-    pt_ds = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", split="train[:25000]")
-    def format_pt(example): return {"messages": [{"role": "text", "content": example["text"]}]}
+    # 🌟 1. 骨骼重塑：使用纯本地的高质量 FineWeb-Edu 数据
+    print("   -> 抽取 25,000 条顶级教育预训练数据 (本地 FineWeb-Edu)...")
+    
+    local_fineweb_path = "/mnt/hf-cache/datasets/fineweb_local/fineweb-edu-00000.parquet"
+    
+    # 使用 parquet 引擎加载
+    pt_ds = load_dataset("parquet", data_files=local_fineweb_path, split="train[:25000]")
+    
+    # 将它的 'text' 字段转化为标准的 messages 格式
+    def format_pt(example): 
+        return {"messages": [{"role": "text", "content": example["text"]}]}
+        
+    # 丢弃掉 fineweb 原本自带的各种杂乱字段 (如 url, id, token_count 等)
     pt_ds = pt_ds.map(format_pt, remove_columns=pt_ds.column_names)
 
     # 2. 情商恢复：UltraChat (30% - 15,000条)
@@ -248,6 +266,10 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="mi
                   save_every_n_steps=250, resume_from_checkpoint=None, 
                   checkpoint_dir="./healing_checkpoints", max_update_steps=1200,
                   accelerator=None): # 👈 新增接收口
+    # 🌟 开启梯度检查点 (核武器级显存优化)
+    student_model.gradient_checkpointing_enable()
+    # ⚠️ 开启检查点时，必须关闭 KV Cache
+    student_model.config.use_cache = False
     
     # 🚀 如果外部传进来了 accelerator 就用外部的，没传就自己建一个（方便单卡调试）
     if accelerator is None:
@@ -382,12 +404,22 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="mi
                 
                 # --- MLP 缓冲层 Feature 蒸馏 ---
                 loss_feat = torch.tensor(0.0, device=device)
+                
+                # 🌟 核心修复 1：智能剥离 DDP 外壳，完美兼容多卡环境
+                actual_projectors = feat_projectors.module if hasattr(feat_projectors, "module") else feat_projectors
+                
                 for i, layer_idx in enumerate(feat_layers):
                     s_h = s_outputs.hidden_states[layer_idx + 1]
                     t_h = t_outputs.hidden_states[layer_idx + 1]
                     
-                    s_h_proj = feat_projectors[i](s_h)
-                    cos_sim = F.cosine_similarity(s_h_proj, t_h, dim=-1)
+                    # 🌟 核心修复 2：如果维度一致，直接绕过投影仪，既防报错又省显存
+                    if s_h.shape[-1] == t_h.shape[-1]:
+                        s_h_proj = s_h
+                    else:
+                        s_h_proj = actual_projectors[i](s_h)
+                    
+                    # 保持你优秀的余弦相似度计算逻辑不变，但加上 .float() 防止混合精度溢出产生 NaN
+                    cos_sim = F.cosine_similarity(s_h_proj.float(), t_h.float(), dim=-1)
                     valid_feat = (1.0 - cos_sim) * attention_mask
                     loss_feat += (valid_feat.sum() / num_tokens)
                     
