@@ -287,15 +287,16 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="mi
     lora_params, mpo_params = [], []
     
     for name, param in student_model.named_parameters():
-        if "lora_A" in name or "lora_B" in name:
-            param.requires_grad = True
-            lora_params.append(param)
-            trainable_params_count += param.numel()
-        elif "core" in name:
-            param.requires_grad = True
-            mpo_params.append(param)
-            trainable_params_count += param.numel()
+            if "lora_A" in name or "lora_B" in name:
+                param.requires_grad = True
+                lora_params.append(param)
+                trainable_params_count += param.numel()
+            elif "core" in name:
+                # 🌟 坚决冻结 MPO 骨架！防止连乘导致的梯度核爆！
+                param.requires_grad = False
                 
+
+            
     accelerator.print(f"🔓 解冻参数量: {trainable_params_count/1e6:.2f}M")
 
     teacher_model.eval()
@@ -324,9 +325,9 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="mi
         ) for _ in feat_layers
     ])
 
+    # 既然不练 MPO，优化器里就把它去掉
     optimizer_grouped_parameters = [
         {"params": lora_params, "lr": lr},
-        {"params": mpo_params, "lr": lr * 0.1},
         {"params": feat_projectors.parameters(), "lr": lr} 
     ]
     optimizer = bnb.optim.AdamW8bit(optimizer_grouped_parameters, weight_decay=0.01)
@@ -374,7 +375,13 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="mi
 
             with accelerator.accumulate(student_model):
                 with torch.no_grad():
-                    t_outputs = teacher_model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                    # 🌟 安全护盾：确保输入数据传到了 Teacher 所在的卡上
+                    teacher_dev = next(teacher_model.parameters()).device
+                    t_outputs = teacher_model(
+                        input_ids.to(teacher_dev), 
+                        attention_mask=attention_mask.to(teacher_dev), 
+                        output_hidden_states=True
+                    )
                 
                 s_outputs = student_model(input_ids, attention_mask=attention_mask, labels=labels, output_hidden_states=True)
                 loss_task = s_outputs.loss if s_outputs.loss is not None else torch.tensor(0.0, device=device)
@@ -409,24 +416,27 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="mi
                 actual_projectors = feat_projectors.module if hasattr(feat_projectors, "module") else feat_projectors
                 
                 for i, layer_idx in enumerate(feat_layers):
-                    s_h = s_outputs.hidden_states[layer_idx + 1]
-                    t_h = t_outputs.hidden_states[layer_idx + 1]
+                    # 获取该层的输出，并统一拉到当前卡
+                    s_h = s_outputs.hidden_states[layer_idx + 1].to(device)
+                    t_h = t_outputs.hidden_states[layer_idx + 1].to(device)
                     
-                    # 🌟 核心修复 2：如果维度一致，直接绕过投影仪，既防报错又省显存
                     if s_h.shape[-1] == t_h.shape[-1]:
                         s_h_proj = s_h
                     else:
                         s_h_proj = actual_projectors[i](s_h)
                     
-                    # 保持你优秀的余弦相似度计算逻辑不变，但加上 .float() 防止混合精度溢出产生 NaN
                     cos_sim = F.cosine_similarity(s_h_proj.float(), t_h.float(), dim=-1)
-                    valid_feat = (1.0 - cos_sim) * attention_mask
-                    loss_feat += (valid_feat.sum() / num_tokens)
+                    valid_feat = (1.0 - cos_sim) * attention_mask.to(device)
+                    loss_feat += (valid_feat.sum() / num_tokens.to(device))
                     
                 loss_feat = loss_feat / len(feat_layers)
                 
-                # --- 终极融合 ---
-                loss = (lam_log * loss_logit + lam_feat * loss_feat + lam_task * loss_task)
+                # --- 终极融合：强制都在同一张卡上计算 ---
+                loss = (
+                    lam_log * loss_logit.to(device) + 
+                    lam_feat * loss_feat.to(device) + 
+                    lam_task * loss_task.to(device)
+                )
                 
                 # 反向传播 (Accelerator 自动处理 Grad Scaling)
                 accelerator.backward(loss)

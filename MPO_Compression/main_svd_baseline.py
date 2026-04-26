@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MPO 究极压缩管线 (Block-Wise Joint Optimization V8.0)
+SVD 究极压缩管线 (Block-Wise Joint Optimization V8.0)
 包含：激活空间 Block-Loss、联合门控寻优、逐层误差级联吸收、ASVD 初始化！
 """
 
@@ -40,6 +40,59 @@ from mpo_modules.factorization import estimate_mpo_bond_dim
 from calibration import get_activation_scales
 from healing import train_healing
 
+class SVDLinear(nn.Module):
+    """
+    同等参数量下的 SVD 骨架 (内置 ASVD 激活缩放逻辑，保证与 MPO 对决的公平性)
+    """
+    def __init__(self, in_features, out_features, rank, W_orig, s_vector=None, skip_init=False):
+        super().__init__()
+        target_dtype, target_device = W_orig.dtype, W_orig.device
+        
+        # SVD 分解出两个小矩阵: B (rank x in_features) 和 A (out_features x rank)
+        self.B = nn.Linear(in_features, rank, bias=False, device=target_device, dtype=target_dtype)
+        self.A = nn.Linear(rank, out_features, bias=False, device=target_device, dtype=target_dtype)
+        self.bias = None # 保持与 MPO 接口一致
+        
+        if skip_init:
+            return
+            
+        with torch.no_grad():
+            W_float = W_orig.float()
+            
+            # 1. 激活值缩放 (ASVD 逻辑)
+            if s_vector is not None:
+                s_vec_safe = torch.clamp(s_vector.to(target_device).float(), min=1e-6)
+                W_scaled = W_float * s_vec_safe.unsqueeze(0)
+            else:
+                W_scaled = W_float
+            
+            # 2. 安全 SVD 分解
+            try:
+                U, S, Vh = torch.linalg.svd(W_scaled, full_matrices=False)
+            except RuntimeError:
+                print("      [⚠️ GPU SVD 内存碎片, 降级至 CPU 计算 Vanilla SVD...]")
+                U, S, Vh = torch.linalg.svd(W_scaled.cpu(), full_matrices=False)
+                U, S, Vh = U.to(target_device), S.to(target_device), Vh.to(target_device)
+            
+            # 3. 截断到目标 Rank 并平分奇异值
+            S_sqrt = torch.diag(torch.sqrt(S[:rank].clamp(min=0)))
+            A_weight = U[:, :rank] @ S_sqrt
+            B_weight = S_sqrt @ Vh[:rank, :]
+            
+            # 4. 反向缩放还原
+            if s_vector is not None:
+                # 对应于除以 s_vector
+                B_weight = B_weight / s_vec_safe.unsqueeze(0)
+            
+            # 5. 注入参数
+            self.B.weight.data.copy_(B_weight.to(target_dtype))
+            self.A.weight.data.copy_(A_weight.to(target_dtype))
+
+    def forward(self, x): 
+        # 严格执行 B -> A 的两步线性投影
+        return self.A(self.B(x))
+
+        
 def compute_mpo_core_shapes(out_fac, in_fac, bond_dim, num_cores):
     shapes, prev = [], 1
     for k in range(num_cores - 1):
@@ -113,9 +166,6 @@ class ResMPOWrapper(nn.Module):
 
 # 🌟 修正 1：完美修复 PPL 数学计算逻辑
 def eval_ppl(model, tokenizer, max_len=2048, stride=512, max_tokens=15000):
-    # 如果模型还被 DDP 包裹着，解包
-    if hasattr(model, 'module'):
-        model = model.module
     model.eval() 
     print("⏳ 正在计算 Wikitext-2 PPL...")
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
@@ -249,16 +299,25 @@ def main():
                 lin = getattr(student_layer.mlp, proj_name)
                 in_f, out_f = lin.weight.shape[1], lin.weight.shape[0]
                 
-                prefix = f"model.layers.{layer_idx}.mlp.{proj_name}.mpo.cores."
-                core_keys = [k for k in state_dict.keys() if k.startswith(prefix)]
-                NUM_CORES = len(core_keys)
-                if NUM_CORES == 0: continue 
+                # ==== 替换为兼容双模式的重构逻辑 ====
+                mpo_prefix = f"model.layers.{layer_idx}.mlp.{proj_name}.mpo.cores."
+                svd_prefix = f"model.layers.{layer_idx}.mlp.{proj_name}.mpo.A.weight"
                 
-                real_cores = []
-                for i in range(NUM_CORES):
-                    real_cores.append(torch.nn.Parameter(state_dict[f"{prefix}{i}"].clone().to(device=lin.weight.device)))
+                if svd_prefix in state_dict:
+                    # 如果存档里有 A.weight，说明是 SVD 的存档
+                    rank = state_dict[svd_prefix].shape[1]
+                    mpo = SVDLinear(in_f, out_f, rank, lin.weight, skip_init=True)
+                else:
+                    # 否则正常重构 MPO
+                    core_keys = [k for k in state_dict.keys() if k.startswith(mpo_prefix)]
+                    NUM_CORES = len(core_keys)
+                    if NUM_CORES == 0: continue 
+                    real_cores = []
+                    for i in range(NUM_CORES):
+                        real_cores.append(torch.nn.Parameter(state_dict[f"{mpo_prefix}{i}"].clone().to(device=lin.weight.device)))
+                    mpo = MPOLinear(in_f, out_f, real_cores)
                 
-                mpo = MPOLinear(in_f, out_f, real_cores)
+                # 动态获取 LoRA Rank (保持不变)
                 lora_prefix = f"model.layers.{layer_idx}.mlp.{proj_name}.lora_A"
                 LORA_RANK = state_dict[lora_prefix].shape[0] if lora_prefix in state_dict else 32
                 
@@ -322,47 +381,28 @@ def main():
             ]:
                 lin = getattr(student_layer.mlp, proj)
                 out_f, in_f = lin.weight.shape
-                chi_ffn = estimate_mpo_bond_dim(in_f, out_f, NUM_CORES, ratio)
-                out_fac = find_factors_balanced(out_f, NUM_CORES)
-                in_fac  = find_factors_balanced(in_f, NUM_CORES)
-
-                s_vec = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.{proj}")
-                s_gpu = None
-                if s_vec is not None:
-                    s_gpu = s_vec.to(lin.weight.device).float().contiguous() if isinstance(s_vec, torch.Tensor) else float(s_vec)
-                    if is_down and isinstance(s_gpu, torch.Tensor):
-                        s_gpu = s_gpu[perm].contiguous()
-
-                W_cpu_for_mpo = W_perm.detach().cpu().float()
-                s_cpu_for_mpo = s_gpu.detach().cpu().float() if isinstance(s_gpu, torch.Tensor) else s_gpu
-
-                # 🌟 修正 3：防止 bond_dim=256 硬编码导致参数超标
-                current_bond_dim = 256 if args.adaptive_mode == "quantum" else chi_ffn
-
-                cores = factor_linear_mpo_custom(
-                    W_cpu_for_mpo, 
-                    bond_dim=current_bond_dim,        
-                    num_cores=NUM_CORES, 
-                    out_fac=out_fac, 
-                    in_fac=in_fac,
-                    s_vector=s_cpu_for_mpo, 
-                    adaptive_mode=args.adaptive_mode,  
-                    quantum_scale=args.quantum_scale   
-                )
-
-                orig_params = W_perm.numel()
-                actual_mpo_params = sum(c.numel() for c in cores)
-                actual_lora_params = in_f * LORA_RANK + out_f * LORA_RANK
-                actual_total_params = actual_mpo_params + actual_lora_params
+                # ================= 替换为：严格同等参数量的 SVD 截断 =================
+                orig_params = out_f * in_f
+                target_params = int(orig_params * ratio)      # 总预算
+                lora_params = LORA_RANK * (in_f + out_f)      # LoRA 固定开销
+                svd_budget = target_params - lora_params      # 留给 SVD 的预算
+                
+                # 核心数学：SVD 参数量 = rank * in_f + rank * out_f
+                svd_rank = svd_budget // (in_f + out_f)
+                svd_rank = max(1, min(svd_rank, min(in_f, out_f))) # 安全边界
+                
+                # 实例化我们刚才写的 SVDLinear (它现在伪装成了 MPO 对象)
+                mpo = SVDLinear(in_f, out_f, svd_rank, W_perm, s_vector=s_gpu)
+                
+                actual_svd_params = svd_rank * (in_f + out_f)
+                actual_total_params = actual_svd_params + lora_params
                 actual_ratio = actual_total_params / orig_params
                 
                 if accelerator.is_main_process:
-                    print(f"      ↳ [{proj}] 压缩率: {actual_ratio*100:.2f}% (MPO: {actual_mpo_params}, LoRA: {actual_lora_params})")
-
-                cleaned_cores = [c.to(device=lin.weight.device, dtype=lin.weight.dtype) for c in cores]
+                    print(f"      ↳ [{proj}] 同等预算 SVD 截断 -> Rank: {svd_rank} | 压缩率: {actual_ratio*100:.2f}% (SVD: {actual_svd_params}, LoRA: {lora_params})")
+                
+                # 接回你原来的 ResMPOWrapper (它不知道内部换成了 SVD，它依然能完美工作！)
                 W_orig_for_res = W_perm.to(dtype=lin.weight.dtype)
-
-                mpo = MPOLinear(in_f, out_f, cleaned_cores, s_vector=s_gpu)
                 setattr(student_layer.mlp, proj, ResMPOWrapper(mpo, in_f, out_f, LORA_RANK, W_orig_for_res, skip_svd=False, s_vector=s_gpu))
 
         if accelerator.is_main_process:
@@ -418,8 +458,11 @@ def main():
                 wrapper = getattr(student_layer.mlp, proj)
                 wrapper.lora_A.requires_grad = True
                 wrapper.lora_B.requires_grad = True
-                for core in wrapper.mpo.cores: 
-                    core.requires_grad = False # 坚决不练 MPO
+                if hasattr(wrapper.mpo, 'cores'):
+                    for core in wrapper.mpo.cores: core.requires_grad = False
+                else: # SVD 模式兼容
+                    wrapper.mpo.A.weight.requires_grad = False
+                    wrapper.mpo.B.weight.requires_grad = False
                 
                 trainable_params_for_opt.extend([
                     {"params": wrapper.lora_A, "lr": 1e-4}, 
