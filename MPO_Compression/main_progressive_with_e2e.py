@@ -250,12 +250,25 @@ def main():
         state_dict = ckpt['model_state_dict']
 
         # 🌟 修复：恢复时重新计算 permutation，确保 MPO cores 和 weight 坐标系对齐
-        if accelerator.is_main_process: print("🔄 重新计算 gate/up 联合排列...")
-        if args.disable_asvd:
-            activation_scales_dict = {}
+        SCALES_CACHE = "/mnt/sx_data/resume_activation_scales.pt"
+        perm_map = ckpt.get('perm_map', None)  # 优先读取 checkpoint 中保存的排列
+
+        if perm_map is None:
+            # 🔒 旧格式 checkpoint：只在主进程计算激活值，避免多进程竞争 datasets 缓存
+            if accelerator.is_main_process:
+                print("🔄 重新计算 gate/up 联合排列...")
+                if args.disable_asvd:
+                    activation_scales_dict = {}
+                else:
+                    activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=64, max_len=512)
+                torch.save(activation_scales_dict, SCALES_CACHE)
+            accelerator.wait_for_everyone()
+            if not accelerator.is_main_process:
+                activation_scales_dict = torch.load(SCALES_CACHE, map_location="cpu")
         else:
-            # 只需要少量校准数据重新提取激活值，比重新跑阶段1+2快得多
-            activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=64, max_len=512)
+            activation_scales_dict = {}  # 不需要重新计算
+            if accelerator.is_main_process:
+                print("🔄 从 checkpoint 恢复 gate/up 联合排列...")
 
         for layer_idx in range(student_model.config.num_hidden_layers):
             student_layer = student_model.model.layers[layer_idx]
@@ -278,10 +291,12 @@ def main():
                 s_val_gate = s_vec_gate.to(W_gate_raw.device).float() if isinstance(s_vec_gate, torch.Tensor) else torch.tensor(1.0, device=W_gate_raw.device)
                 s_val_up   = s_vec_up.to(W_up_raw.device).float() if isinstance(s_vec_up, torch.Tensor) else torch.tensor(1.0, device=W_up_raw.device)
 
-                W_gate_scaled = W_gate_raw * s_val_gate
-                W_up_scaled   = W_up_raw * s_val_up
-
-                perm_cpu = find_permutation_for_ffn(W_gate_scaled, W_up_scaled)
+                if perm_map is not None and layer_idx in perm_map:
+                    perm_cpu = perm_map[layer_idx]
+                else:
+                    W_gate_scaled = W_gate_raw * s_val_gate
+                    W_up_scaled   = W_up_raw * s_val_up
+                    perm_cpu = find_permutation_for_ffn(W_gate_scaled, W_up_scaled)
                 perm = perm_cpu.to(W_gate_raw.device)
 
                 with torch.no_grad():
@@ -321,13 +336,14 @@ def main():
             ppl_mid = eval_ppl(unwrapped_mid, tokenizer)
             print(f"🌟 【阶段二】级联收敛 PPL: {ppl_mid}")
         accelerator.wait_for_everyone()
-    else:        
+    else:
         print(f"\n🦴 [阶段 1] 动态搭建全网络 MPO 骨架...")
+        perm_map = {}  # 收集每层 gate/up 的排列，供 checkpoint 恢复时直接读取
         if args.disable_asvd:
-            activation_scales_dict = {} 
+            activation_scales_dict = {}
         else:
             activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=256, max_len=512)
-        
+
         for layer_idx in range(num_layers):
             ratio = custom_ratio_map.get(layer_idx, get_u_shape_ratio(layer_idx, num_layers, args.target_ratio))
             if ratio >= 0.99: continue
@@ -358,6 +374,7 @@ def main():
                 perm = torch.arange(intermediate_size, device=W_gate_raw.device)
             else:
                 perm_cpu = find_permutation_for_ffn(W_gate_scaled, W_up_scaled)
+                perm_map[layer_idx] = perm_cpu  # 保存排列供恢复使用
                 perm = perm_cpu.to(W_gate_raw.device)
 
                 W_gate_perm = W_gate_raw[perm, :].contiguous()
@@ -581,7 +598,7 @@ def main():
                     tmp_ckpt = PROGRESS_CKPT + f".tmp_{layer_idx}"
                     print(f"    💾 正在主卡落盘全模型备份...")
                     state_dict = accelerator.unwrap_model(student_model).state_dict()
-                    torch.save({'next_layer': layer_idx + 1, 'model_state_dict': state_dict}, tmp_ckpt)
+                    torch.save({'next_layer': layer_idx + 1, 'model_state_dict': state_dict, 'perm_map': perm_map}, tmp_ckpt)
                     os.replace(tmp_ckpt, PROGRESS_CKPT)
                     print(f"    ✅ Layer {layer_idx} 级联存档成功落盘！")
                 except Exception as e:
