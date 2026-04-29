@@ -36,15 +36,14 @@ def calculate_quantum_bonds(S_list: List[torch.Tensor], quantum_scale: float = 1
     for S in S_list:
         # 1. 能量概率分布
         energy = S ** 2
-        prob = energy / (energy.sum() + 1e-12)
+        # 🛠️ 修复：绝对的非负钳制，防止 NaN
+        prob = (energy / energy.sum().clamp(min=1e-12)).clamp(min=1e-12)
         
         # 2. 计算以 2 为底的香农熵 (Shannon Entropy)
-        # 物理学中有时用自然对数 e，这里用 2 更符合信息论的 Bit 直觉
-        entropy = -torch.sum(prob * torch.log2(prob + 1e-12)).item()
+        entropy = -torch.sum(prob * torch.log2(prob)).item()
         entropies.append(entropy)
         
         # 3. 💥 核心物理公式：\chi = \alpha * 2^S
-        # quantum_scale (\alpha) 是全局缩放因子，控制你对"信息冗余"的容忍度
         bond = int(round(quantum_scale * (2 ** entropy)))
         
         # 防止极端情况导致矩阵碎裂或爆显存
@@ -53,9 +52,6 @@ def calculate_quantum_bonds(S_list: List[torch.Tensor], quantum_scale: float = 1
         
     return dynamic_bonds, entropies
 
-# ============================================================
-# 🌟 新增：基于纠缠熵的动态 Bond 分配引擎
-# ============================================================
 
 def calculate_dynamic_bonds_by_entropy(S_list: List[torch.Tensor], target_total_bond: int, min_bond: int = 4) -> List[int]:
     """
@@ -63,12 +59,11 @@ def calculate_dynamic_bonds_by_entropy(S_list: List[torch.Tensor], target_total_
     """
     entropies = []
     for S in S_list:
-        # 1. 能量概率分布 (将奇异值平方视作能量)
         energy = S ** 2
-        prob = energy / (energy.sum() + 1e-12)
+        # 🛠️ 修复：绝对的非负钳制，防止 NaN
+        prob = (energy / energy.sum().clamp(min=1e-12)).clamp(min=1e-12)
         
-        # 2. 计算香农/冯诺依曼纠缠熵: S = -sum(p * ln(p))
-        entropy = -torch.sum(prob * torch.log2(prob + 1e-12)).item()
+        entropy = -torch.sum(prob * torch.log2(prob)).item()
         entropies.append(entropy)
         
     # 3. 预算分配
@@ -83,9 +78,6 @@ def calculate_dynamic_bonds_by_entropy(S_list: List[torch.Tensor], target_total_
         
     return dynamic_bonds, entropies
 
-# ============================================================
-# 核心：自定义 MPO 分解（带 Two-Pass 纠缠熵自适应）
-# ============================================================
 
 def factor_linear_mpo_custom(
     weight: torch.Tensor,
@@ -98,15 +90,10 @@ def factor_linear_mpo_custom(
     noise_scale: float = 1e-5,
     adaptive_mode: str = "quantum", # 默认设为 quantum
     energy_threshold: float = 0.99,
-    quantum_scale: float = 2.0,     # 🌟 必须加上这个接收口
+    quantum_scale: float = 2.0,     
     min_bond: int = 4,              
 ) -> List[torch.Tensor]:
-    """
-    将权重矩阵分解为 MPO cores。支持三种截断策略：
-      - "fixed" : 死板地一刀切，所有内部 bond 全是 bond_dim
-      - "energy": 不设上限，只保证保留 energy_threshold 的能量 (原 adaptive=True)
-      - "entropy": 🌟 探针模式，维持总参数预算不变，用纠缠熵智能倾斜分配 bond
-    """
+
     assert num_cores >= 2, "num_cores must be >= 2"
 
     W_orig = weight.detach().clone()
@@ -117,7 +104,6 @@ def factor_linear_mpo_custom(
     if out_fac is None: out_fac = find_factors_balanced(out_f, num_cores)
     if in_fac is None: in_fac = find_factors_balanced(in_f, num_cores)
 
-    # 内部执行单次顺序 SVD 切分的闭包函数
     def _execute_mpo_pass(W_tensor, custom_bonds=None, mode="fixed"):
         W = W_tensor.to(torch.float32)
         if s_vector is not None:
@@ -162,7 +148,6 @@ def factor_linear_mpo_custom(
             S_history.append(S.clone())
             rank_avail = min(U.shape[1], S.shape[0], Vh.shape[0])
 
-            # 截断逻辑路由
             if mode == "energy":
                 S_sq = S[:rank_avail] ** 2
                 total_energy = S_sq.sum().item()
@@ -174,7 +159,7 @@ def factor_linear_mpo_custom(
                     r = 1
             elif mode == "custom_list" and custom_bonds is not None:
                 r = custom_bonds[k]
-            else: # "fixed" 或 fallback
+            else: 
                 r = bond_dim
 
             r = max(min_bond, min(int(r), int(rank_avail)))
@@ -187,7 +172,6 @@ def factor_linear_mpo_custom(
 
         cores.append(T.reshape(prev, out_fac[-1], in_fac[-1], 1))
         
-        # 统一清洗和转换格式
         cleaned = []
         for c in cores:
             if not torch.isfinite(c).all(): c = torch.nan_to_num(c, nan=0.0)
@@ -195,20 +179,19 @@ def factor_linear_mpo_custom(
             
         return cleaned, S_history, actual_ranks
 
+
     # ========================================================
     # 策略路由枢纽
     # ========================================================
     if adaptive_mode == "entropy":
         # 1. 探针 Pass：用无限制的 bond (99999) 探查矩阵的真实物理结构
-        _, S_list, _ = _execute_mpo_pass(W_orig, mode="fixed", custom_bonds=[99999]*(num_cores-1))
+        # 🌟 修复：必须用 custom_list，否则 99999 不会生效，会被外面的 bond_dim 假截断！
+        _, S_list, _ = _execute_mpo_pass(W_orig, mode="custom_list", custom_bonds=[99999]*(num_cores-1))
         
-        # 2. 算命：目标总预算 = 用户期望的平均 bond_dim * 切口数量
         target_total = bond_dim * (num_cores - 1)
         allocated_bonds, entropies = calculate_dynamic_bonds_by_entropy(S_list, target_total, min_bond)
         print(f"    [Entropy 路由] 各切口纠缠熵: {[f'{e:.2f}' for e in entropies]}")
         print(f"    [Entropy 路由] 预算重新分配: {bond_dim}x{num_cores-1} -> {allocated_bonds}")
-        
-        # 3. 执行 Pass：带着上帝视角的预算进行精准下刀
         cores, _, final_ranks = _execute_mpo_pass(W_orig, custom_bonds=allocated_bonds, mode="custom_list")
         
     elif adaptive_mode == "energy":
@@ -217,23 +200,24 @@ def factor_linear_mpo_custom(
         
     elif adaptive_mode == "quantum":
         # 1. 探针 Pass：拿真实奇异值
-        _, S_list, _ = _execute_mpo_pass(W_orig, mode="fixed", custom_bonds=[99999]*(num_cores-1))
-        
-        # 2. 算命：完全基于 2^S，不考虑总预算！
-        # 这里的 quantum_scale 就是你的唯一超参数，通常设为 1.0 ~ 5.0
+        # 🌟 修复：同上！
+        _, S_list, _ = _execute_mpo_pass(W_orig, mode="custom_list", custom_bonds=[99999]*(num_cores-1))
         print("quantum scale:", quantum_scale)
-        allocated_bonds, entropies = calculate_quantum_bonds(S_list, quantum_scale=quantum_scale)
+        
+        allocated_bonds, entropies = calculate_quantum_bonds(
+            S_list, 
+            quantum_scale=quantum_scale, 
+            min_bond=min_bond, 
+            max_bond=bond_dim 
+        )
         
         print(f"    [Quantum 路由] 测得纠缠熵 S: {[f'{e:.2f}' for e in entropies]}")
         print(f"    [Quantum 路由] 2^S 独立裁决 Bond: {allocated_bonds}")
-        
-        # 3. 执行 Pass
         cores, _, final_ranks = _execute_mpo_pass(W_orig, custom_bonds=allocated_bonds, mode="custom_list")
 
     else: # "fixed"
         cores, _, final_ranks = _execute_mpo_pass(W_orig, mode="fixed")
 
-    # PBC 转换逻辑 (保持不变)
     if boundary.lower() == "periodic":
         r_0 = int(final_ranks[0]) if len(final_ranks) > 0 else int(bond_dim)
         pad_dim = r_0 - 1
@@ -246,8 +230,7 @@ def factor_linear_mpo_custom(
 
     return cores
 
-# estimate_bond_dim, reconstruct_mpo_matrix 和 verify 保持你的原有逻辑
-# 为了验证，我们可以修改一下 verify_mpo_equivalence 的调用方式
+
 def estimate_bond_dim(weight: torch.Tensor, num_cores: int, target_ratio: float = 0.1) -> int:
     out_f, in_f = weight.shape
     dense_params = out_f * in_f
@@ -296,9 +279,8 @@ def verify_mpo_equivalence():
     print(f"=== 1. 初始化数据 ===")
     A = torch.randn(D_out, D_in)
     
-    # 制造一个极度不均衡的奇异值分布，模拟大模型特征
     U, S, V = torch.linalg.svd(A, full_matrices=False)
-    S_new = torch.exp(-torch.arange(len(S))/10.0) * 1000 # 强行搞成陡峭分布
+    S_new = torch.exp(-torch.arange(len(S))/10.0) * 1000 
     A = U @ torch.diag(S_new) @ V
     
     X = torch.randn(D_in)
@@ -317,7 +299,6 @@ def verify_mpo_equivalence():
     Y_mpo2 = Y_mpo_t2.squeeze(0).squeeze(-1).reshape(-1)
     print(f"Max diff: {torch.max(torch.abs(Y_gt - Y_mpo2)).item():.3e}\n")
 
-    # 🌟 新增 Quantum 模式验证
     print(f"=== 4. Quantum 模式验证 (quantum_scale=2.5, 硬上限=64) ===")
     cores_quantum = factor_linear_mpo_custom(A, bond_dim=64, num_cores=3, adaptive_mode="quantum", quantum_scale=2.5)
     Y_mpo_t3 = torch.einsum('aoib,bpjc,cqkd,ijk->aopqd', *cores_quantum, X_tensor)

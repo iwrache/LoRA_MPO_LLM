@@ -1,0 +1,135 @@
+Layer,Mode,PPL
+Baseline,Full_Model,6.06
+0,Mode 1: Pure MPO,7.08
+0,Mode 2: MPO + LoRA,6.42
+0,Mode 3: Perm + MPO,6.54
+0,Mode 4: Perm + MPO + LoRA,6.33
+1,Mode 1: Pure MPO,6.63
+1,Mode 2: MPO + LoRA,6.49
+1,Mode 3: Perm + MPO,6.64
+1,Mode 4: Perm + MPO + LoRA,6.54
+2,Mode 1: Pure MPO,6.63
+2,Mode 2: MPO + LoRA,6.53
+2,Mode 3: Perm + MPO,6.59
+2,Mode 4: Perm + MPO + LoRA,6.51
+3,Mode 1: Pure MPO,6.54
+3,Mode 2: MPO + LoRA,6.58
+3,Mode 3: Perm + MPO,6.51
+3,Mode 4: Perm + MPO + LoRA,6.52
+4,Mode 1: Pure MPO,6.6
+4,Mode 2: MPO + LoRA,6.47
+4,Mode 3: Perm + MPO,6.51
+4,Mode 4: Perm + MPO + LoRA,6.44
+5,Mode 1: Pure MPO,6.71
+5,Mode 2: MPO + LoRA,6.57
+5,Mode 3: Perm + MPO,6.64
+5,Mode 4: Perm + MPO + LoRA,6.51
+6,Mode 1: Pure MPO,6.37
+6,Mode 2: MPO + LoRA,6.43
+6,Mode 3: Perm + MPO,6.35
+6,Mode 4: Perm + MPO + LoRA,6.36
+7,Mode 1: Pure MPO,6.33
+7,Mode 2: MPO + LoRA,6.33
+7,Mode 3: Perm + MPO,6.32
+7,Mode 4: Perm + MPO + LoRA,6.3
+8,Mode 1: Pure MPO,6.31
+8,Mode 2: MPO + LoRA,6.31
+8,Mode 3: Perm + MPO,6.29
+8,Mode 4: Perm + MPO + LoRA,6.29
+9,Mode 1: Pure MPO,6.38
+9,Mode 2: MPO + LoRA,6.37
+9,Mode 3: Perm + MPO,6.34
+9,Mode 4: Perm + MPO + LoRA,6.35
+10,Mode 1: Pure MPO,6.25
+10,Mode 2: MPO + LoRA,6.29
+10,Mode 3: Perm + MPO,6.25
+10,Mode 4: Perm + MPO + LoRA,6.28
+11,Mode 1: Pure MPO,6.3
+11,Mode 2: MPO + LoRA,6.34
+11,Mode 3: Perm + MPO,6.28
+11,Mode 4: Perm + MPO + LoRA,6.29
+12,Mode 1: Pure MPO,6.18
+12,Mode 2: MPO + LoRA,6.19
+12,Mode 3: Perm + MPO,6.18
+12,Mode 4: Perm + MPO + LoRA,6.17
+13,Mode 1: Pure MPO,6.26
+13,Mode 2: MPO + LoRA,6.27
+13,Mode 3: Perm + MPO,6.26
+13,Mode 4: Perm + MPO + LoRA,6.27
+14,Mode 1: Pure MPO,6.26
+14,Mode 2: MPO + LoRA,6.26
+14,Mode 3: Perm + MPO,6.26
+14,Mode 4: Perm + MPO + LoRA,6.26
+15,Mode 1: Pure MPO,6.27
+15,Mode 2: MPO + LoRA,6.27
+15,Mode 3: Perm + MPO,6.27
+15,Mode 4: Perm + MPO + LoRA,6.27
+16,Mode 1: Pure MPO,6.44
+16,Mode 2: MPO + LoRA,6.42
+16,Mode 3: Perm + MPO,6.38
+16,Mode 4: Perm + MPO + LoRA,6.35
+17,Mode 1: Pure MPO,6.31
+17,Mode 2: MPO + LoRA,6.3
+17,Mode 3: Perm + MPO,6.3
+17,Mode 4: Perm + MPO + LoRA,6.3
+18,Mode 1: Pure MPO,6.34
+18,Mode 2: MPO + LoRA,6.33
+18,Mode 3: Perm + MPO,6.34
+18,Mode 4: Perm + MPO + LoRA,6.34
+19,Mode 1: Pure MPO,6.32
+19,Mode 2: MPO + LoRA,6.32
+19,Mode 3: Perm + MPO,6.32
+19,Mode 4: Perm + MPO + LoRA,6.31
+20,Mode 1: Pure MPO,6.36
+20,Mode 2: MPO + LoRA,6.35
+20,Mode 3: Perm + MPO,6.34
+20,Mode 4: Perm + MPO + LoRA,6.34
+21,Mode 1: Pure MPO,6.34
+21,Mode 2: MPO + LoRA,6.34
+21,Mode 3: Perm + MPO,6.32
+21,Mode 4: Perm + MPO + LoRA,6.33
+22,Mode 1: Pure MPO,6.32
+22,Mode 2: MPO + LoRA,6.31
+22,Mode 3: Perm + MPO,6.33
+22,Mode 4: Perm + MPO + LoRA,6.32
+23,Mode 1: Pure MPO,6.28
+23,Mode 2: MPO + LoRA,6.28
+23,Mode 3: Perm + MPO,6.28
+23,Mode 4: Perm + MPO + LoRA,6.28
+24,Mode 1: Pure MPO,6.22
+24,Mode 2: MPO + LoRA,6.21
+24,Mode 3: Perm + MPO,6.23
+24,Mode 4: Perm + MPO + LoRA,6.22
+25,Mode 1: Pure MPO,6.28
+25,Mode 2: MPO + LoRA,6.28
+25,Mode 3: Perm + MPO,6.28
+25,Mode 4: Perm + MPO + LoRA,6.26
+26,Mode 1: Pure MPO,6.3
+26,Mode 2: MPO + LoRA,6.31
+26,Mode 3: Perm + MPO,6.3
+26,Mode 4: Perm + MPO + LoRA,6.3
+27,Mode 1: Pure MPO,6.34
+27,Mode 2: MPO + LoRA,6.34
+27,Mode 3: Perm + MPO,6.34
+27,Mode 4: Perm + MPO + LoRA,6.34
+28,Mode 1: Pure MPO,6.33
+28,Mode 2: MPO + LoRA,6.31
+28,Mode 3: Perm + MPO,6.34
+28,Mode 4: Perm + MPO + LoRA,6.32
+29,Mode 1: Pure MPO,6.49
+29,Mode 2: MPO + LoRA,6.47
+29,Mode 3: Perm + MPO,6.46
+29,Mode 4: Perm + MPO + LoRA,6.44
+30,Mode 1: Pure MPO,6.66
+30,Mode 2: MPO + LoRA,6.58
+30,Mode 3: Perm + MPO,6.66
+30,Mode 4: Perm + MPO + LoRA,6.62
+31,Mode 1: Pure MPO,9.15
+31,Mode 2: MPO + LoRA,7.23
+31,Mode 3: Perm + MPO,8.24
+31,Mode 4: Perm + MPO + LoRA,7.27
+Baseline,Full_Model,6.06
+10,Mode 1: Pure MPO,6.25
+10,Mode 2: MPO + LoRA,6.29
+10,Mode 3: Perm + MPO,6.25
+10,Mode 4: Perm + MPO + LoRA,6.28

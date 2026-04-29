@@ -38,7 +38,7 @@ from mpo_modules.core import MPOLinear
 from test_MPO import factor_linear_mpo_custom, find_factors_balanced
 from mpo_modules.factorization import estimate_mpo_bond_dim
 from calibration import get_activation_scales
-from healing import train_healing
+from healing2 import train_healing
 
 def compute_mpo_core_shapes(out_fac, in_fac, bond_dim, num_cores):
     shapes, prev = [], 1
@@ -151,7 +151,7 @@ def eval_ppl(model, tokenizer, max_len=2048, stride=512, max_tokens=15000):
 
     if total_tokens == 0: return float("nan")
     return round(torch.exp(torch.tensor(total_loss / total_tokens)).item(), 2)
-'''
+
 def get_u_shape_ratio(layer_idx, total_layers, target_ratio):
     if layer_idx < 3 or layer_idx >= total_layers - 3: return 1.0
     start_idx, end_idx = 3, total_layers - 4
@@ -159,12 +159,6 @@ def get_u_shape_ratio(layer_idx, total_layers, target_ratio):
     x = (layer_idx - center) / half_range
     base, amplitude = max(0.1, target_ratio - 0.15), 0.45 
     return max(0.1, min(0.95, base + amplitude * (x ** 2)))
-'''
-def get_u_shape_ratio(layer_idx, total_layers, target_ratio):
-    # 首尾 3 层仍然不压缩
-    if layer_idx < 3 or layer_idx >= total_layers - 3:
-        return 1.0
-    return target_ratio
 
 def main():
     parser = argparse.ArgumentParser()
@@ -173,11 +167,12 @@ def main():
     parser.add_argument("--custom_layers", type=int, nargs='*', default=[])
     parser.add_argument("--custom_ratios", type=float, nargs='*', default=[])
     parser.add_argument("--local_steps", type=int, default=300)
-    parser.add_argument("--e2e_steps", type=int, default=2000)
+    parser.add_argument("--e2e_steps", type=int, default=1000)
     parser.add_argument("--save_path", type=str, default="/mnt/sx_data/ultimate_healed_llama.pt")
     
     parser.add_argument("--adaptive_mode", type=str, default="entropy", choices=["fixed", "energy", "entropy", "quantum"])
     parser.add_argument("--quantum_scale", type=float, default=0.6)
+    parser.add_argument("--tune_mpo", action="store_true", help="继续训练时解冻 MPO 核心")
     parser.add_argument("--disable_asvd", action="store_true")
     parser.add_argument("--disable_perm", action="store_true")
     args = parser.parse_args()
@@ -233,7 +228,7 @@ def main():
     calib_inputs = [tokenizer(t, return_tensors="pt", max_length=256, truncation=True).input_ids for t in calib_texts]
     print(f"✅ 成功构建 {len(calib_inputs)} 条混合黄金特征数据 (Wiki+Chat)！")
 
-    PROGRESS_CKPT = "/mnt/sx_data/progressive_layer_checkpoint_2.pt"
+    PROGRESS_CKPT = "/mnt/sx_data/progressive_layer_checkpoint.pt"
     
     skip_to_phase_4 = False
     ppl_mid = 0.0  # 🌟 修复变量未定义崩溃
@@ -272,23 +267,12 @@ def main():
                 
         student_model.load_state_dict(state_dict, strict=False)
         del ckpt, state_dict; gc.collect(); torch.cuda.empty_cache()
-
-        # ======= 🌟 新增：中间 PPL 评测 =======
-        if accelerator.is_main_process:
-            print("\n[阶段 3-补测] 测量 Block-wise 级联特征对齐后的 PPL...")
-            student_model.eval()
-            student_model.to(torch.bfloat16)
-            # 🌟 补测时也用官方解包
-            unwrapped_mid = accelerator.unwrap_model(student_model)
-            ppl_mid = eval_ppl(unwrapped_mid, tokenizer)
-            print(f"🌟 【阶段二】级联收敛 PPL: {ppl_mid}")
-        accelerator.wait_for_everyone()
     else:        
         print(f"\n🦴 [阶段 1] 动态搭建全网络 MPO 骨架...")
         if args.disable_asvd:
             activation_scales_dict = {} 
         else:
-            activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=256, max_len=512)
+            activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=32, max_len=256)
         
         for layer_idx in range(num_layers):
             ratio = custom_ratio_map.get(layer_idx, get_u_shape_ratio(layer_idx, num_layers, args.target_ratio))
@@ -346,7 +330,10 @@ def main():
                 s_vec = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.{proj}")
                 s_gpu = None
                 if s_vec is not None:
-                    s_gpu = s_vec.to(lin.weight.device).float().contiguous() if isinstance(s_vec, torch.Tensor) else float(s_vec)
+                    if isinstance(s_vec, torch.Tensor):
+                        s_gpu = s_vec.to(lin.weight.device).float().contiguous()
+                    else:
+                        s_gpu = torch.tensor(float(s_vec), device=lin.weight.device, dtype=torch.float32)
                     if is_down and isinstance(s_gpu, torch.Tensor):
                         s_gpu = s_gpu[perm].contiguous()
 
@@ -392,24 +379,6 @@ def main():
             print(f" 🌟 全模型真实保留率: {(new_total_params / orig_total_params) * 100:.2f}%")
             print("="*70)
 
-
-
-        # ========== 🌟 新增：阶段 1 结束后立即评测 PPL（纯静态分解，无任何微调） ==========
-        accelerator.wait_for_everyone()  # 确保所有进程已完成骨架搭建
-
-        if accelerator.is_main_process:
-            print("\n🔬 [阶段 1.5] 评测纯 MPO+LoRA 静态分解后的 PPL（与消融脚本对齐）...")
-            student_model.eval()
-            student_model.to(torch.bfloat16)
-            # 解包，虽然此时模型未被 DDP 包裹，但用 unwrap_model 最安全
-            unwrapped_student = accelerator.unwrap_model(student_model)
-            ppl_static = eval_ppl(unwrapped_student, tokenizer)
-            print(f"📊 纯静态分解 PPL (MPO+LoRA+Perm, 未微调): {ppl_static:.2f}")
-            # 可选：将这个值保存下来，以便最后战报打印
-            # 例如设置一个变量 ppl_stage1 = ppl_static
-
-        accelerator.wait_for_everyone()  # 等待主进程评测完毕再进入阶段 2
-
         # ---------------------------------------------------------
         # 🌌 [阶段 2] 逐层误差吸收 (Sequential Cascading) 
         # ---------------------------------------------------------
@@ -437,7 +406,6 @@ def main():
             embed_device = student_model.model.embed_tokens.weight.device
             
             with torch.no_grad():
-                # 累积误差只让主卡打印进度条，但三张卡都要参与！
                 for input_ids in tqdm(calib_inputs, desc=f"积累前序层误差", leave=False, disable=not accelerator.is_main_process):
                     try: student_model(input_ids.to(embed_device))
                     except StopForwardException: pass 
@@ -449,18 +417,13 @@ def main():
             trainable_params_for_opt = []
             raw_params_for_clip = []
             
-            # 冻结 SVD/MPO 骨架，只练 LoRA！
+            # 🌟 核心修复：绝对冻结 MPO，只练 LoRA！
             for proj in ["gate_proj", "up_proj", "down_proj"]:
                 wrapper = getattr(student_layer.mlp, proj)
                 wrapper.lora_A.requires_grad = True
                 wrapper.lora_B.requires_grad = True
-                
-                # 兼容 MPO 与 SVD 两种物理骨架的冻结
-                if hasattr(wrapper.mpo, 'cores'):
-                    for core in wrapper.mpo.cores: core.requires_grad = False
-                else: 
-                    wrapper.mpo.A.weight.requires_grad = False
-                    wrapper.mpo.B.weight.requires_grad = False
+                for core in wrapper.mpo.cores: 
+                    core.requires_grad = False # 坚决不练 MPO
                 
                 trainable_params_for_opt.extend([
                     {"params": wrapper.lora_A, "lr": 1e-4}, 
@@ -475,17 +438,17 @@ def main():
             X_flat = X_calib_tensor
             num_tokens = X_flat.shape[0]
             
-            # 🔥 这里没有 if main_process，3张卡都在跑，保证通信不超时！
             for step in range(args.local_steps):
                 optimizer.zero_grad()
                 
-                # 强制同步种子
+                # 🌟 修复：多卡并行撕裂护盾，确保三卡采样的随机数绝对一致！
                 torch.manual_seed(42 + layer_idx * 10000 + step)
                 sample_indices = torch.randperm(num_tokens)[:2048]
                 
                 current_dtype = next(student_layer.parameters()).dtype
                 X_batch = X_flat[sample_indices].to(device=layer_device, dtype=current_dtype)
                 
+                # 🌟 修正 5：加上混合精度护航，并将 backward 移出 autocast 块！
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     with torch.no_grad():
                         Y_orig = teacher_layer.mlp(X_batch.to(teacher_device)).to(layer_device)
@@ -511,52 +474,46 @@ def main():
                 wrapper.lora_B.requires_grad = False
 
             del optimizer, cached_mlp_inputs, X_calib_tensor, X_flat; torch.cuda.empty_cache(); gc.collect()
-
-            # ========================================================
-            # 🌟 极速防爆同步：只提取当前层刚刚训练完的 LoRA 权重，只有几MB
-            # ========================================================
             accelerator.wait_for_everyone() 
 
-            SYNC_FILE = "/mnt/sx_data/tmp_lora_sync_mpo.pt"
-            
-            if accelerator.is_main_process:
-                # 提取这一层的 LoRA 参数
-                lora_dict = {k: v for k, v in student_layer.state_dict().items() if "lora" in k}
-                torch.save(lora_dict, SYNC_FILE)
-            
-            accelerator.wait_for_everyone()
-            
-            # 所有 GPU 瞬间加载这几个MB的文件，强制对齐防漂移
-            if os.path.exists(SYNC_FILE):
-                if accelerator.is_main_process:
-                    print(f"    🔄 [多卡同步] 正在极速对齐 Layer {layer_idx} 防漂移参数...")
-                
-                lora_dict = torch.load(SYNC_FILE, map_location=layer_device)
-                student_layer.load_state_dict(lora_dict, strict=False)
-                del lora_dict
-                
-            accelerator.wait_for_everyone()
-
-            # 主进程静默保存完整模型，供意外断电恢复。其他卡只等不加载。
+            # ========================================================
+            # 阶段 2 结尾的保存逻辑
+            # ========================================================
             if accelerator.is_main_process:
                 try:
                     tmp_ckpt = PROGRESS_CKPT + f".tmp_{layer_idx}"
-                    print(f"    💾 正在主卡落盘全模型备份...")
+                    print(f"    💾 正在主卡提取权重...")
                     state_dict = accelerator.unwrap_model(student_model).state_dict()
+                    
+                    print(f"    💾 正在写入临时文件...")
                     torch.save({'next_layer': layer_idx + 1, 'model_state_dict': state_dict}, tmp_ckpt)
+                    
+                    print(f"    💾 正在替换正式文件...")
                     os.replace(tmp_ckpt, PROGRESS_CKPT)
                     print(f"    ✅ Layer {layer_idx} 级联存档成功落盘！")
                 except Exception as e:
                     print(f"    🚨 致命警告：保存异常！{e}")
             
+            # 第一道门：所有 GPU 在这里等 GPU 0 把文件写完
             accelerator.wait_for_everyone()
             
+            # 🌟 核心修复：多卡浮点数漂移强制对齐（所有 GPU 共同执行）
+            if os.path.exists(PROGRESS_CKPT):
+                if accelerator.is_main_process:
+                    print(f"    🔄 [多卡同步] 主卡已落盘，正在强制所有 GPU 对齐权重...")
+                
+                ckpt_sync = torch.load(PROGRESS_CKPT, map_location='cpu')
+                student_model.load_state_dict(ckpt_sync['model_state_dict'], strict=False)
+                del ckpt_sync
+                gc.collect()
+                torch.cuda.empty_cache()
+            
+            # 第二道门：所有 GPU 等待大家全都加载完毕，再一起整齐划一地走向下一层
+            accelerator.wait_for_everyone()
         
         if accelerator.is_main_process:
             print("\n[阶段 3] 测量 Block-wise 级联特征对齐后的 PPL...")
-            # 🌟 补测时也用官方解包
-            unwrapped_mid = accelerator.unwrap_model(student_model)
-            ppl_mid = eval_ppl(unwrapped_mid, tokenizer)
+            ppl_mid = eval_ppl(student_model, tokenizer)
             print(f"🌟 【阶段二】级联收敛 PPL: {ppl_mid}")
 
     accelerator.wait_for_everyone()
@@ -572,55 +529,83 @@ def main():
     if getattr(args, 'disable_asvd', False): exp_suffix += "_noASVD"
     if getattr(args, 'disable_perm', False): exp_suffix += "_noPerm"
     
-    HEALING_DIR = f"/mnt/sx_data/healing_checkpoints_mixed_2_{exp_suffix}"
-    FINAL_CKPT = f"{HEALING_DIR}/checkpoint_upd_{args.e2e_steps}.pt"
     
-    if os.path.exists(FINAL_CKPT):
-        if accelerator.is_main_process:
-            print(f"\n📦 检测到已完成的 [{exp_suffix}] 实验存档：{FINAL_CKPT}")
-        try:
-            checkpoint = torch.load(FINAL_CKPT, map_location="cpu")
-            state_dict = checkpoint.get("trainable_state_dict", checkpoint)
-            student_model.load_state_dict(state_dict, strict=False)
-            del checkpoint, state_dict; gc.collect()
-        except Exception as e:
-            if accelerator.is_main_process:
-                print(f"❌ 警告：检测到损坏的存档文件 ({e})，将重新开始训练！")
-                os.remove(FINAL_CKPT)
-            accelerator.wait_for_everyone()
-            
-    if not os.path.exists(FINAL_CKPT):
-        student_model = train_healing(
-            student_model=student_model, tokenizer=tokenizer, teacher_model=teacher_model, 
-            dataset_name="mixed", epochs=1, batch_size=1, accum_steps=16, lr=2e-5, seq_len=1024,  
-            save_every_n_steps=500, checkpoint_dir=HEALING_DIR, 
-            max_update_steps=args.e2e_steps, resume_from_checkpoint=None, accelerator=accelerator
-        )
+    
+    HEALING_DIR = f"/mnt/sx_data/healing_checkpoints_mixed_{exp_suffix}"
+    FINAL_CKPT = f"{HEALING_DIR}/checkpoint_upd_1000.pt"  # 假设旧存档以步数命名
 
-    accelerator.wait_for_everyone()
+    if args.tune_mpo and os.path.exists(FINAL_CKPT):
+        # 继续训练 MPO 模式
+        NEW_E2E_STEPS = args.e2e_steps + 1000  # 例如再跑 500 步
+        new_dir = f"/mnt/sx_data/healing_checkpoints_mixed_{exp_suffix}_mpotune"
+        if accelerator.is_main_process:
+            print(f"💪 加载旧 Checkpoint 并启动 MPO 核心训练 (新增 {NEW_E2E_STEPS - args.e2e_steps} 步)")
+        # 手动加载模型权重（避免优化器不一致）
+        ckpt = torch.load(FINAL_CKPT, map_location='cpu')
+        student_model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
+        del ckpt; gc.collect()
+        # 调用 train_healing，resume_from_checkpoint 设为原本 FINAL_CKPT 以获取 global_update_step
+        student_model = train_healing(
+            student_model=student_model,
+            teacher_model=teacher_model,
+            tokenizer=tokenizer,
+            epochs=1, batch_size=1, accum_steps=16, lr=2e-5, seq_len=1024,
+            save_every_n_steps=200,
+            checkpoint_dir=new_dir,
+            max_update_steps=NEW_E2E_STEPS,
+            resume_from_checkpoint=FINAL_CKPT,   # 用于读取步数，但不加载优化器
+            accelerator=accelerator,
+            tune_mpo=True
+        )
+        # 训练结束后再评测
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            print("\n🏆 MPO 继续训练完成，计算最终 PPL...")
+            student_model.eval()
+            student_model.to(torch.bfloat16)
+            final_ppl = eval_ppl(student_model, tokenizer)
+            print(f"🎯 MPO 精调后 PPL: {final_ppl:.2f}")
+        return  # 直接结束，不再走下面的逻辑    
+    else:
+        # 原来的正常 healing / 加载逻辑
+        if os.path.exists(FINAL_CKPT):
+            if accelerator.is_main_process:
+                print(f"\n📦 检测到已完成的 [{exp_suffix}] 实验存档：{FINAL_CKPT}")
+            try:
+                ckpt = torch.load(FINAL_CKPT, map_location='cpu')
+                state_dict = ckpt.get("trainable_state_dict", ckpt)
+                student_model.load_state_dict(state_dict, strict=False)
+                del ckpt, state_dict; gc.collect()
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"❌ 警告：检测到损坏的存档文件 ({e})，将重新开始训练！")
+                    os.remove(FINAL_CKPT)
+                accelerator.wait_for_everyone()
+
+        if not os.path.exists(FINAL_CKPT):
+            student_model = train_healing(
+                student_model=student_model, tokenizer=tokenizer, teacher_model=teacher_model,
+                dataset_name="mixed", epochs=1, batch_size=1, accum_steps=16, lr=2e-5, seq_len=1024,
+                save_every_n_steps=500, checkpoint_dir=HEALING_DIR,
+                max_update_steps=args.e2e_steps, resume_from_checkpoint=None, accelerator=accelerator
+            )
+
+        accelerator.wait_for_everyone()
+
 
     if accelerator.is_main_process:
         print("\n🏆 开始计算压缩+康复微调后的最终 PPL...")
         student_model.eval()
         student_model.to(torch.bfloat16)
-        # 🌟 使用 Accelerate 的官方解包方法，杜绝任何 DDP/FSDP 阻碍
-        unwrapped_student = accelerator.unwrap_model(student_model)
-        final_ppl = eval_ppl(unwrapped_student, tokenizer)
+        final_ppl = eval_ppl(student_model, tokenizer)
         
         print("\n" + "="*70)
         print(" 🏆 终极 SOTA 级架构战报")
         print("="*70)
         print(f" 1. 满血原版 PPL                 : {5.43:>8.2f}")
-        
-        # 🌟 安全打印中间 PPL
-        if isinstance(ppl_mid, (int, float)):
-            print(f" 2. Block-wise 吸收后 PPL        : {ppl_mid:>8.2f}")
-        else:
-            print(f" 2. Block-wise 吸收后 PPL        :   Skipped")
-            
+        print(f" 2. Block-wise 吸收后 PPL        : {ppl_mid:>8.2f}")
         print(f" 3. 全局端到端复活 PPL (Healed)  : {final_ppl:>8.2f}")
         print("="*70)
 
 if __name__ == "__main__":
     main()
-# 原版PPL： 5.43， block-wise级联后PPL： 46.70， E2E Healing后PPL： 18.48！

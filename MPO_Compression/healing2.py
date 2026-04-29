@@ -353,12 +353,11 @@ def train_healing(student_model, tokenizer, teacher_model=None, dataset_name="mi
     trainable_params = [p for p in student_model.parameters() if p.requires_grad] + list(feat_projectors.parameters())
     
     if resume_from_checkpoint is not None:
-
-        # 👇 传入 accelerator
-        resume_info = load_checkpoint(student_model, feat_projectors, resume_from_checkpoint, optimizer, scheduler, accelerator)
-        if resume_info is not None:
-            start_epoch = 0
-            global_update_step = resume_info['global_update_step']
+        # 仅加载权重，不恢复任何训练状态
+        resume_info = load_checkpoint(student_model, feat_projectors, resume_from_checkpoint,
+                                    optimizer, scheduler, accelerator, load_optimizer=False)
+        # 强制重置 global_update_step（即从头开始计数）
+        global_update_step = 0
             
     for epoch in range(epochs):
         epoch_loss = 0

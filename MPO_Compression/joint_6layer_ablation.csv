@@ -1,0 +1,9 @@
+Mode,PPL
+Baseline (Full Model),6.06
+Mode 1: Pure MPO,11.78
+Mode 2: MPO + LoRA,9.07
+Mode 3: Perm + MPO,10.37
+Mode 4: Perm + MPO + LoRA,9.03
+Baseline (Full Model),6.06
+Mode 5: Perm + MPO (Relaxed),10.38
+Mode 6: Perm + Relaxed MPO + LoRA,9.05
