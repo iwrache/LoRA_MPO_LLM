@@ -248,28 +248,66 @@ def main():
         if accelerator.is_main_process: print("骨架重塑中...")
         ckpt = torch.load(PROGRESS_CKPT, map_location="cpu")
         state_dict = ckpt['model_state_dict']
-        
+
+        # 🌟 修复：恢复时重新计算 permutation，确保 MPO cores 和 weight 坐标系对齐
+        if accelerator.is_main_process: print("🔄 重新计算 gate/up 联合排列...")
+        if args.disable_asvd:
+            activation_scales_dict = {}
+        else:
+            # 只需要少量校准数据重新提取激活值，比重新跑阶段1+2快得多
+            activation_scales_dict = get_activation_scales(student_model, tokenizer, num_samples=64, max_len=512)
+
         for layer_idx in range(student_model.config.num_hidden_layers):
             student_layer = student_model.model.layers[layer_idx]
+
+            prefix_gate = f"model.layers.{layer_idx}.mlp.gate_proj.mpo.cores."
+            prefix_up   = f"model.layers.{layer_idx}.mlp.up_proj.mpo.cores."
+            has_mpo = len([k for k in state_dict.keys() if k.startswith(prefix_gate)]) > 0
+
+            # 如果该层有 MPO，先对原始 weight 做排列（和阶段1一致）
+            if has_mpo and not args.disable_perm:
+                gate_lin = student_layer.mlp.gate_proj
+                up_lin   = student_layer.mlp.up_proj
+                down_lin = student_layer.mlp.down_proj
+
+                W_gate_raw = gate_lin.weight.detach().float()
+                W_up_raw   = up_lin.weight.detach().float()
+
+                s_vec_gate = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.gate_proj")
+                s_vec_up   = activation_scales_dict.get(f"model.layers.{layer_idx}.mlp.up_proj")
+                s_val_gate = s_vec_gate.to(W_gate_raw.device).float() if isinstance(s_vec_gate, torch.Tensor) else torch.tensor(1.0, device=W_gate_raw.device)
+                s_val_up   = s_vec_up.to(W_up_raw.device).float() if isinstance(s_vec_up, torch.Tensor) else torch.tensor(1.0, device=W_up_raw.device)
+
+                W_gate_scaled = W_gate_raw * s_val_gate
+                W_up_scaled   = W_up_raw * s_val_up
+
+                perm_cpu = find_permutation_for_ffn(W_gate_scaled, W_up_scaled)
+                perm = perm_cpu.to(W_gate_raw.device)
+
+                with torch.no_grad():
+                    gate_lin.weight.copy_(W_gate_raw[perm, :].to(dtype=gate_lin.weight.dtype))
+                    up_lin.weight.copy_(W_up_raw[perm, :].to(dtype=up_lin.weight.dtype))
+                    down_lin.weight.copy_(down_lin.weight.detach().float()[:, perm].to(dtype=down_lin.weight.dtype))
+
             for proj_name in ["gate_proj", "up_proj", "down_proj"]:
                 lin = getattr(student_layer.mlp, proj_name)
                 in_f, out_f = lin.weight.shape[1], lin.weight.shape[0]
-                
+
                 prefix = f"model.layers.{layer_idx}.mlp.{proj_name}.mpo.cores."
                 core_keys = [k for k in state_dict.keys() if k.startswith(prefix)]
                 NUM_CORES = len(core_keys)
-                if NUM_CORES == 0: continue 
-                
+                if NUM_CORES == 0: continue
+
                 real_cores = []
                 for i in range(NUM_CORES):
                     real_cores.append(torch.nn.Parameter(state_dict[f"{prefix}{i}"].clone().to(device=lin.weight.device)))
-                
+
                 mpo = MPOLinear(in_f, out_f, real_cores)
                 lora_prefix = f"model.layers.{layer_idx}.mlp.{proj_name}.lora_A"
                 LORA_RANK = state_dict[lora_prefix].shape[0] if lora_prefix in state_dict else 32
-                
+
                 setattr(student_layer.mlp, proj_name, ResMPOWrapper(mpo, in_f, out_f, LORA_RANK, lin.weight, skip_svd=True))
-                
+
         student_model.load_state_dict(state_dict, strict=False)
         del ckpt, state_dict; gc.collect(); torch.cuda.empty_cache()
 
