@@ -47,6 +47,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Worktrees
+.worktrees/
+
 # Checkpoints
 checkpoints/
 *.ckpt
